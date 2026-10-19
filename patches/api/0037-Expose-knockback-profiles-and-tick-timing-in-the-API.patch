@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Admin <callmeabbascallmeabbas@gmail.com>
+Date: Mon, 19 Oct 2026 09:54:47 +0300
+Subject: [PATCH] Expose knockback profiles and tick timing in the API
+
+
+diff --git a/src/main/java/org/bukkit/Bukkit.java b/src/main/java/org/bukkit/Bukkit.java
+index 2ae8b301052020afc17c15435d8022c55cce9675..448ed5e49721909e463870a0f7a113e2101be44a 100644
+--- a/src/main/java/org/bukkit/Bukkit.java
++++ b/src/main/java/org/bukkit/Bukkit.java
+@@ -114,6 +114,15 @@ public final class Bukkit {
+         return server.getVersion();
+     }
+ 
++    /**
++     * Gets the mean execution time of the last 100 completed ticks, excluding waiting.
++     *
++     * @return milliseconds per tick, or zero before the first completed tick
++     */
++    public static double getMspt() {
++        return server.getMspt();
++    }
++
+     /**
+      * Gets the Bukkit version that this server is running.
+      *
+diff --git a/src/main/java/org/bukkit/Server.java b/src/main/java/org/bukkit/Server.java
+index 51849294e3618b94aec5c81c0438d95e00e3a33a..2f69518c4dbde7ff32abd82781eecd551535aad6 100644
+--- a/src/main/java/org/bukkit/Server.java
++++ b/src/main/java/org/bukkit/Server.java
+@@ -79,6 +79,16 @@ public interface Server extends PluginMessageRecipient, net.kyori.adventure.audi
+      */
+     public String getVersion();
+ 
++    /**
++     * Average execution time of the last 100 completed server ticks, excluding
++     * time spent waiting for the next tick. Returns zero before the first tick.
++     *
++     * @return milliseconds per tick
++     */
++    default double getMspt() {
++        throw new UnsupportedOperationException("MSPT measurement is not supported by this server");
++    }
++
+     /**
+      * Gets the Bukkit version that this server is running.
+      *
+diff --git a/src/main/java/org/bukkit/entity/Player.java b/src/main/java/org/bukkit/entity/Player.java
+index 9ef233b8d928d1c53e203e34943dee3d72268b5f..06e5adfcd8acb8d550d9a14c8b6bc7887a66a628 100644
+--- a/src/main/java/org/bukkit/entity/Player.java
++++ b/src/main/java/org/bukkit/entity/Player.java
+@@ -1408,9 +1408,10 @@ public interface Player extends HumanEntity, Conversable, CommandSender, Offline
+         }
+ 
+         /**
+-         * Set the view distance for this player
++         * Set the view distance for this player. An explicit value survives world
++         * changes; use -1 to follow the current world's configured view distance.
+          *
+-         * @param viewDistance View distance
++         * @param viewDistance distance in chunks (clamped to 3-32), or -1 for the world default
+          */
+         public void setViewDistance(int viewDistance)
+         {
+@@ -1426,6 +1427,33 @@ public interface Player extends HumanEntity, Conversable, CommandSender, Offline
+     Spigot spigot();
+     // Spigot end
+ 
++    /**
++     * Gets the effective knockback profile in the player's current world.
++     * @return configured profile name, or "default" for the legacy knockback settings
++     */
++    default String getKnockbackProfile() {
++        throw new UnsupportedOperationException("Knockback profiles are not supported");
++    }
++
++    /**
++     * Selects a profile for incoming knockback. The profile also controls whether
++     * this player's attacks stop their sprint. Selection lasts for this session.
++     * @param profile name in the current world's knockbackProfiles, "default", or
++     *                null to follow the current world's default profile
++     * @throws IllegalArgumentException if the name is not configured
++     */
++    default void setKnockbackProfile(String profile) {
++        throw new UnsupportedOperationException("Knockback profiles are not supported");
++    }
++
++    /**
++     * Gets a snapshot of the available profile names in this player's world.
++     * @return immutable set including "default"
++     */
++    default java.util.Set<String> getAvailableKnockbackProfiles() {
++        throw new UnsupportedOperationException("Knockback profiles are not supported");
++    }
++
+     // PandaSpigot start - Adventure
+     @Override
+     default net.kyori.adventure.identity.Identity identity() {

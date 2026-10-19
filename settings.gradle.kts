@@ -10,3 +10,4 @@ fun setupSubproject(name: String, dir: String) {
 setupSubproject("pandaspigot-server", "PandaSpigot-Server")
 setupSubproject("pandaspigot-api", "PandaSpigot-API")
 setupSubproject("paperclip", "paperclip")
+setupSubproject("pandaspigot-via-ack", "compatibility/via-ack")

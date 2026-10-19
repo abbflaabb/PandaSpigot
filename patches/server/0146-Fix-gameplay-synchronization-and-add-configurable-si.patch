@@ -1,0 +1,2748 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Admin <callmeabbascallmeabbas@gmail.com>
+Date: Mon, 19 Oct 2026 09:54:55 +0300
+Subject: [PATCH 146/147] Fix gameplay synchronization and add configurable
+ simulation controls
+
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 5fd93af71de1c39690c5335b94b9cb2b62af14d1..c02fafa65763d83a1348adbb56c18485f45a39d5 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -48,6 +48,7 @@ dependencies {
+ 
+     testImplementation("junit:junit:4.11")
+     testImplementation("org.hamcrest:hamcrest-library:1.3")
++    testImplementation("org.mockito:mockito-core:4.11.0")
+ }
+ 
+ fun TaskContainer.registerRunTask(
+diff --git a/src/main/java/com/hpfxd/pandaspigot/TickTimeSampler.java b/src/main/java/com/hpfxd/pandaspigot/TickTimeSampler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f03280d7367ae63094c10bd17d9c2dfb6b786c46
+--- /dev/null
++++ b/src/main/java/com/hpfxd/pandaspigot/TickTimeSampler.java
+@@ -0,0 +1,22 @@
++package com.hpfxd.pandaspigot;
++
++/** Thread-safe mean duration of the last 100 completed ticks, excluding tick-loop waiting. */
++public final class TickTimeSampler {
++    private final long[] samples = new long[100];
++    private int index;
++    private int size;
++    private long total;
++
++    public synchronized void record(long nanos) {
++        if (nanos < 0) throw new IllegalArgumentException("Negative tick duration");
++        total -= samples[index];
++        samples[index] = nanos;
++        total += nanos;
++        index = (index + 1) % samples.length;
++        if (size < samples.length) size++;
++    }
++
++    public synchronized double getMspt() {
++        return size == 0 ? 0 : total / (double) size / 1_000_000.0;
++    }
++}
+diff --git a/src/main/java/com/hpfxd/pandaspigot/XorShiftRandom.java b/src/main/java/com/hpfxd/pandaspigot/XorShiftRandom.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e0d9171cf8614ceada538484755483aaa9be39b
+--- /dev/null
++++ b/src/main/java/com/hpfxd/pandaspigot/XorShiftRandom.java
+@@ -0,0 +1,34 @@
++package com.hpfxd.pandaspigot;
++
++import java.util.Random;
++
++/** Optional xorshift64* generator for world simulation, never authentication. */
++public final class XorShiftRandom extends Random {
++    private static final long serialVersionUID = 1L;
++    private long state;
++
++    public XorShiftRandom() {
++        this(new Random().nextLong());
++    }
++
++    public XorShiftRandom(long seed) {
++        super(seed);
++    }
++
++    @Override
++    public synchronized void setSeed(long seed) {
++        // Retain Random's Gaussian cache reset and serialized superclass state.
++        super.setSeed(seed);
++        this.state = seed == 0 ? 0x9E3779B97F4A7C15L : seed;
++    }
++
++    @Override
++    protected synchronized int next(int bits) {
++        long value = this.state;
++        value ^= value >>> 12;
++        value ^= value << 25;
++        value ^= value >>> 27;
++        this.state = value;
++        return (int) ((value * 0x2545F4914F6CDD1DL) >>> (64 - bits));
++    }
++}
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+index c63cd15c13b503d91ef0245ffe0de7f85dd6f540..7fee75e362710f47f95de1abea9f1455232e8653 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+@@ -47,6 +47,7 @@ public class PandaSpigotConfig {
+         try {
+             CommentedConfigurationNode root = loader.load();
+             config = root.get(PandaSpigotConfig.class);
++            config.performance.validate();
+             
+             // worlds
+             CommentedConfigurationNode worldsNode = root.node("worlds")
+@@ -58,6 +59,7 @@ public class PandaSpigotConfig {
+                             "To specify settings for a specific world, just add a new section with the world's name.");
+             ConfigurationNode defaultWorldNode = worldsNode.node("default");
+             defaultWorldConfig = defaultWorldNode.get(PandaSpigotWorldConfig.class);
++            defaultWorldConfig.validate();
+             defaultWorldNode.set(defaultWorldConfig); // populate default in config
+             
+             root.set(config); // update backing node
+@@ -77,7 +79,8 @@ public class PandaSpigotConfig {
+             if (worldName.equals("default")) continue; // skip "default"
+             ConfigurationNode worldNode = entry.getValue();
+             
+-            PandaSpigotWorldConfig worldConfig = worldNode.get(PandaSpigotWorldConfig.class);
++            PandaSpigotWorldConfig worldConfig = worldNode.copy().mergeFrom(node.node("default")).get(PandaSpigotWorldConfig.class);
++            worldConfig.validate();
+             
+             worldConfigs.put(worldName.toString(), worldConfig);
+         }
+@@ -96,6 +99,8 @@ public class PandaSpigotConfig {
+     }
+     
+     //------------------------------------------------------------------------
++    public ServerPerformanceConfig performance = new ServerPerformanceConfig();
++
+     @Comment("On servers with plugins that constantly churn through scoreboards, there is a risk of\n" +
+         "degraded GC performance due to the number of scoreboards held on by weak references.\n" +
+         "Most plugins don't even need the (vanilla) functionality that requires all plugin\n" +
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
+index f8a434abfe92d31e390b70788805128fd1769a9f..0d2ef9c27dc27157b29fef526b6b17c6d2ad38a2 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
+@@ -6,17 +6,119 @@ import org.spongepowered.configurate.objectmapping.meta.Comment;
+ @ConfigSerializable
+ @SuppressWarnings({"FieldCanBeLocal", "FieldMayBeFinal"})
+ public class PandaSpigotWorldConfig {
++    public WorldPerformanceConfig performance = new WorldPerformanceConfig();
++
+     @Comment("These options control velocity players receive when damaged.")
+-    public KnockbackConfig knockback;
++    public KnockbackConfig knockback = new KnockbackConfig();
++
++    @Comment("Named knockback profiles selectable through Player.setKnockbackProfile. The name default uses the knockback section above.")
++    public java.util.Map<String, KnockbackConfig> knockbackProfiles = new java.util.LinkedHashMap<>();
++
++    public String defaultKnockbackProfile = "default";
++
++    public KnockbackConfig getKnockbackProfile(String name) {
++        if (name != null && knockbackProfiles.containsKey(name)) return knockbackProfiles.get(name);
++        if (name == null && knockbackProfiles.containsKey(defaultKnockbackProfile)) return knockbackProfiles.get(defaultKnockbackProfile);
++        return knockback;
++    }
++
++    public String getKnockbackProfileName(String selected) {
++        if (selected != null && ("default".equals(selected) || knockbackProfiles.containsKey(selected))) return selected;
++        return knockbackProfiles.containsKey(defaultKnockbackProfile) ? defaultKnockbackProfile : "default";
++    }
++
++    public void validate() {
++        if (knockback == null) throw new IllegalArgumentException("knockback must not be null");
++        knockback.validate();
++        for (java.util.Map.Entry<String, KnockbackConfig> entry : knockbackProfiles.entrySet()) {
++            if (entry.getKey().trim().isEmpty() || "default".equals(entry.getKey()) || entry.getValue() == null) {
++                throw new IllegalArgumentException("Invalid knockback profile: " + entry.getKey());
++            }
++            entry.getValue().validate();
++        }
++        if (!"default".equals(defaultKnockbackProfile) && !knockbackProfiles.containsKey(defaultKnockbackProfile)) {
++            throw new IllegalArgumentException("Unknown default knockback profile: " + defaultKnockbackProfile);
++        }
++        fishingRod.validate();
++    }
+ 
+     @ConfigSerializable
+     public static class KnockbackConfig {
++        public boolean enabled = true;
++        public boolean stopSprint = true;
+         public double friction = 2.0;
++        @Comment("When omitted these inherit the legacy friction value. Optional Min/Max pairs sample uniformly for each hit.")
++        public Double frictionHorizontal, frictionVertical;
++        public Double frictionHorizontalMin, frictionHorizontalMax, frictionVerticalMin, frictionVerticalMax;
+         public double horizontal = 0.4;
++        public Double horizontalMin, horizontalMax;
+         public double vertical = 0.4;
++        public Double verticalMin, verticalMax;
+         public double verticalLimit = 0.4000000059604645;
+         public double extraHorizontal = 0.5;
++        public Double extraHorizontalMin, extraHorizontalMax;
+         public double extraVertical = 0.1;
++        public Double extraVerticalMin, extraVerticalMax;
++
++        public double arrowHorizontal = 1.0, arrowVertical = 1.0;
++        public double snowballHorizontal = 1.0, snowballVertical = 1.0;
++        public double eggHorizontal = 1.0, eggVertical = 1.0;
++        public double rodHorizontal = 1.0, rodVertical = 1.0;
++
++        public double frictionHorizontal(java.util.Random random) { return sample(random, frictionHorizontal == null ? friction : frictionHorizontal, frictionHorizontalMin, frictionHorizontalMax); }
++        public double frictionVertical(java.util.Random random) { return sample(random, frictionVertical == null ? friction : frictionVertical, frictionVerticalMin, frictionVerticalMax); }
++        public double horizontal(java.util.Random random) { return sample(random, horizontal, horizontalMin, horizontalMax); }
++        public double vertical(java.util.Random random) { return sample(random, vertical, verticalMin, verticalMax); }
++        public double extraHorizontal(java.util.Random random) { return sample(random, extraHorizontal, extraHorizontalMin, extraHorizontalMax); }
++        public double extraVertical(java.util.Random random) { return sample(random, extraVertical, extraVerticalMin, extraVerticalMax); }
++
++        private static double sample(java.util.Random random, double value, Double min, Double max) {
++            double low = min == null ? value : min;
++            double high = max == null ? value : max;
++            return low == high ? low : low + random.nextDouble() * (high - low);
++        }
++
++        public void validate() {
++            range("friction", friction, null, null, true);
++            range("frictionHorizontal", frictionHorizontal == null ? friction : frictionHorizontal, frictionHorizontalMin, frictionHorizontalMax, true);
++            range("frictionVertical", frictionVertical == null ? friction : frictionVertical, frictionVerticalMin, frictionVerticalMax, true);
++            range("horizontal", horizontal, horizontalMin, horizontalMax, false);
++            range("vertical", vertical, verticalMin, verticalMax, false);
++            range("extraHorizontal", extraHorizontal, extraHorizontalMin, extraHorizontalMax, false);
++            range("extraVertical", extraVertical, extraVerticalMin, extraVerticalMax, false);
++            range("verticalLimit", verticalLimit, null, null, false);
++            for (double multiplier : new double[] { arrowHorizontal, arrowVertical, snowballHorizontal, snowballVertical, eggHorizontal, eggVertical, rodHorizontal, rodVertical }) {
++                range("projectile multiplier", multiplier, null, null, false);
++            }
++        }
++
++        private static void range(String name, double value, Double min, Double max, boolean positive) {
++            double low = min == null ? value : min;
++            double high = max == null ? value : max;
++            if (!Double.isFinite(value) || !Double.isFinite(low) || !Double.isFinite(high)
++                    || value < 0 || low < 0 || high < low || (positive && (value == 0 || low == 0))) {
++                throw new IllegalArgumentException("Invalid knockback " + name + " value/range");
++            }
++        }
++    }
++
++    public FishingRodConfig fishingRod = new FishingRodConfig();
++
++    @ConfigSerializable
++    public static class FishingRodConfig {
++        public boolean randomTrajectory = true;
++        public float launchSpeed = 1.5F;
++        public double horizontalMultiplier = 1.0;
++        public double verticalMultiplier = 1.0;
++        public double gravity = 0.03999999910593033D;
++        public double maximumDistance = 32.0;
++
++        public void validate() {
++            for (double value : new double[] { launchSpeed, horizontalMultiplier, verticalMultiplier, gravity, maximumDistance }) {
++                if (!Double.isFinite(value) || value < 0) throw new IllegalArgumentException("Fishing rod values must be finite and nonnegative");
++            }
++            if (launchSpeed == 0 || maximumDistance == 0) throw new IllegalArgumentException("Fishing rod launch speed and maximum distance must be positive");
++        }
+     }
+ 
+     @Comment("This option makes it so that when players are teleported to a location\n" +
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/ServerPerformanceConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/ServerPerformanceConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c7eb699ac9d4a0042dd2dc6d64dc7626978e373
+--- /dev/null
++++ b/src/main/java/com/hpfxd/pandaspigot/config/ServerPerformanceConfig.java
+@@ -0,0 +1,25 @@
++package com.hpfxd.pandaspigot.config;
++
++import org.spongepowered.configurate.objectmapping.ConfigSerializable;
++import org.spongepowered.configurate.objectmapping.meta.Comment;
++
++@ConfigSerializable
++public class ServerPerformanceConfig {
++    @Comment("Target ticks per second (1-20). This also slows plugin tick timers, gameplay and connection housekeeping.")
++    public int tickRate = 20;
++    @Comment("Use idleTickRate while no players are online. A joining player restores tickRate on the next tick.")
++    public boolean hibernateWhenEmpty = false;
++    public int idleTickRate = 1;
++    @Comment("Stop periodic tab-list latency broadcasts. Keepalive and actual connection latency measurement remain enabled.")
++    public boolean disableTabListPingUpdates = false;
++
++    public void validate() {
++        if (tickRate < 1 || tickRate > 20 || idleTickRate < 1 || idleTickRate > tickRate) {
++            throw new IllegalArgumentException("performance tickRate must be 1-20 and idleTickRate must be 1-tickRate");
++        }
++    }
++
++    public long tickIntervalNanos(int playerCount) {
++        return 1_000_000_000L / (hibernateWhenEmpty && playerCount == 0 ? idleTickRate : tickRate);
++    }
++}
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/WorldPerformanceConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/WorldPerformanceConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..768588103dc85c80626d3b52f5286759953b049a
+--- /dev/null
++++ b/src/main/java/com/hpfxd/pandaspigot/config/WorldPerformanceConfig.java
+@@ -0,0 +1,36 @@
++package com.hpfxd.pandaspigot.config;
++
++import org.spongepowered.configurate.objectmapping.ConfigSerializable;
++import org.spongepowered.configurate.objectmapping.meta.Comment;
++
++/** Opt-in simulation controls for static worlds. Defaults retain normal gameplay. */
++@ConfigSerializable
++public class WorldPerformanceConfig {
++    @Comment("Pause simulation while this world has no players. Chunk unloading and saving still run.")
++    public boolean pauseWhenEmpty = false;
++    @Comment("Skip random chunk ticks, thunder, ice/snow and chunk lighting maintenance. Scheduled blocks still tick.")
++    public boolean disableChunkTicking = false;
++    public boolean disableTileEntityTicking = false;
++    @Comment("Freeze weather timers and transitions; does not clear existing rain or prevent plugin changes.")
++    public boolean disableWeatherTicking = false;
++    public boolean disableNaturalLightning = false;
++    public boolean disableNaturalMobSpawning = false;
++    @Comment("Reject new villagers and freeze existing villagers, preserving their saved data.")
++    public boolean disableVillagers = false;
++    @Comment("Freeze non-player entity simulation. Existing entities remain visible and collidable.")
++    public boolean disableNonPlayerEntityTicking = false;
++    @Comment("Stop periodic entity tracking updates. Initial spawns and removals still work; moving entities appear frozen.")
++    public boolean disableEntityTrackingUpdates = false;
++    @Comment("Keep sand/gravel/anvils static and freeze existing falling-block entities. Re-enable before resuming gameplay.")
++    public boolean disableFallingBlockPhysics = false;
++    public boolean disableLiquidFlow = false;
++    public boolean disableLeafDecay = false;
++    @Comment("Skip scheduled redstone component ticks (repeaters, comparators, torches, lamps, buttons, pressure plates, tripwires and dispensers). Direct interactions still work. Re-enabling may require updating circuits.")
++    public boolean disableRedstoneTicking = false;
++    @Comment("Use xorshift64* for the world's Random. Requires a world reload/restart, changes random outcomes, and is not guaranteed to improve every workload. Default preserves Java Random.")
++    public boolean useFastRandom = false;
++
++    public boolean shouldPause(int playerCount) {
++        return pauseWhenEmpty && playerCount == 0;
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/BlockFalling.java b/src/main/java/net/minecraft/server/BlockFalling.java
+index 1d952b82aafb8b1ff8cbd4d4a23b02179f38af56..54b01ff73509eb4f916675f3bf48b96ea00af503 100644
+--- a/src/main/java/net/minecraft/server/BlockFalling.java
++++ b/src/main/java/net/minecraft/server/BlockFalling.java
+@@ -24,6 +24,11 @@ public class BlockFalling extends Block {
+     }
+ 
+     public void b(World world, BlockPosition blockposition, IBlockData iblockdata, Random random) {
++        if (world.pandaSpigotConfig.performance.disableFallingBlockPhysics) {
++            // Retain the scheduled update so re-enabling physics does not strand this block.
++            world.a(blockposition, this, 20);
++            return;
++        }
+         if (!world.isClientSide) {
+             this.f(world, blockposition);
+         }
+diff --git a/src/main/java/net/minecraft/server/BlockFlowing.java b/src/main/java/net/minecraft/server/BlockFlowing.java
+index 23130ba963a7fb0024cee47a2a44006e08d06353..4669ca2cceeb654e45644403e4171c1cae348ede 100644
+--- a/src/main/java/net/minecraft/server/BlockFlowing.java
++++ b/src/main/java/net/minecraft/server/BlockFlowing.java
+@@ -23,6 +23,11 @@ public class BlockFlowing extends BlockFluids {
+     }
+ 
+     public void b(World world, BlockPosition blockposition, IBlockData iblockdata, Random random) {
++        if (world.pandaSpigotConfig.performance.disableLiquidFlow) {
++            // Keep a sparse pending update to allow flow to resume after a config reload.
++            world.a(blockposition, this, 20);
++            return;
++        }
+         // CraftBukkit start
+         org.bukkit.World bworld = world.getWorld();
+         org.bukkit.Server server = world.getServer();
+diff --git a/src/main/java/net/minecraft/server/BlockLeaves.java b/src/main/java/net/minecraft/server/BlockLeaves.java
+index 399c2bddd4e0ed27a98ab07a20d981f39683a4c3..a196f5a7791ccbdf3667a862373060de9afa6e42 100644
+--- a/src/main/java/net/minecraft/server/BlockLeaves.java
++++ b/src/main/java/net/minecraft/server/BlockLeaves.java
+@@ -44,6 +44,7 @@ public abstract class BlockLeaves extends BlockTransparent {
+     }
+ 
+     public void b(World world, BlockPosition blockposition, IBlockData iblockdata, Random random) {
++        if (world.pandaSpigotConfig.performance.disableLeafDecay) return;
+         if (!world.isClientSide) {
+             if (((Boolean) iblockdata.get(BlockLeaves.CHECK_DECAY)).booleanValue() && ((Boolean) iblockdata.get(BlockLeaves.DECAYABLE)).booleanValue()) {
+                 byte b0 = 4;
+diff --git a/src/main/java/net/minecraft/server/ContainerAnvil.java b/src/main/java/net/minecraft/server/ContainerAnvil.java
+index 2816de678fb2473fdb477bf50c4dc4edbc8df364..5ec01ae3822464fd8eeb560015a33c747454d91e 100644
+--- a/src/main/java/net/minecraft/server/ContainerAnvil.java
++++ b/src/main/java/net/minecraft/server/ContainerAnvil.java
+@@ -28,14 +28,52 @@ public class ContainerAnvil extends Container {
+     private CraftInventoryView bukkitEntity = null;
+     private PlayerInventory player;
+     // CraftBukkit end
++    // PandaSpigot - Custom Bukkit anvils use the same repair/rename logic and original inventory.
++    private boolean customInventory;
++    private boolean updatingCustomInventory;
++    private ItemStack previousInput;
++    private ItemStack previousMaterial;
++    private int previousCost = -1;
+ 
+     public ContainerAnvil(PlayerInventory playerinventory, final World world, final BlockPosition blockposition, EntityHuman entityhuman) {
++        this(playerinventory, world, blockposition, entityhuman, null);
++    }
++
++    public ContainerAnvil(PlayerInventory playerinventory, final World world, final BlockPosition blockposition, EntityHuman entityhuman, org.bukkit.inventory.Inventory inventory) {
+         this.player = playerinventory; // CraftBukkit
+         this.j = blockposition;
+         this.i = world;
+         this.m = entityhuman;
+-        this.a(new Slot(this.h, 0, 27, 47));
+-        this.a(new Slot(this.h, 1, 76, 47));
++        if (inventory != null) {
++            this.customInventory = true;
++            this.checkReachable = false;
++            this.h = ((org.bukkit.craftbukkit.inventory.CraftInventory) inventory).getInventory();
++            this.g = new InventoryCraftResult() {
++                @Override public ItemStack getItem(int slot) { return ContainerAnvil.this.h.getItem(2); }
++                @Override public void setItem(int slot, ItemStack stack) { ContainerAnvil.this.h.setItem(2, stack); }
++                @Override public ItemStack[] getContents() { return new ItemStack[] { getItem(0) }; }
++                @Override public ItemStack splitStack(int slot, int amount) { return splitWithoutUpdate(slot); }
++                @Override public ItemStack splitWithoutUpdate(int slot) {
++                    ItemStack result = getItem(0);
++                    setItem(0, null);
++                    return result;
++                }
++                @Override public void l() { setItem(0, null); }
++            };
++            this.bukkitEntity = new CraftInventoryView(entityhuman.getBukkitEntity(), inventory, this);
++        }
++        this.a(new Slot(this.h, 0, 27, 47) {
++            @Override public void f() {
++                super.f();
++                if (ContainerAnvil.this.customInventory) ContainerAnvil.this.e();
++            }
++        });
++        this.a(new Slot(this.h, 1, 76, 47) {
++            @Override public void f() {
++                super.f();
++                if (ContainerAnvil.this.customInventory) ContainerAnvil.this.e();
++            }
++        });
+         this.a(new Slot(this.g, 2, 134, 47) {
+             public boolean isAllowed(ItemStack itemstack) {
+                 return false;
+@@ -65,6 +103,10 @@ public class ContainerAnvil extends Container {
+                 }
+ 
+                 ContainerAnvil.this.a = 0;
++                if (ContainerAnvil.this.customInventory) {
++                    ContainerAnvil.this.e();
++                    return; // A virtual anvil must not damage a block or play a block effect.
++                }
+                 IBlockData iblockdata = world.getType(blockposition);
+ 
+                 if (!entityhuman.abilities.canInstantlyBuild && !world.isClientSide && iblockdata.getBlock() == Blocks.ANVIL && entityhuman.bc().nextFloat() < 0.12F) {
+@@ -309,8 +351,32 @@ public class ContainerAnvil extends Container {
+         icrafting.setContainerData(this, 0, this.a);
+     }
+ 
++    @Override
++    public void b() {
++        if (this.customInventory && !this.updatingCustomInventory
++                && (!ItemStack.matches(this.previousInput, this.h.getItem(0))
++                    || !ItemStack.matches(this.previousMaterial, this.h.getItem(1)))) {
++            this.previousInput = ItemStack.b(this.h.getItem(0));
++            this.previousMaterial = ItemStack.b(this.h.getItem(1));
++            this.updatingCustomInventory = true;
++            try {
++                this.e(); // Also notice changes made directly through the supplied Bukkit inventory.
++            } finally {
++                this.updatingCustomInventory = false;
++            }
++        }
++        super.b();
++        if (this.customInventory && this.previousCost != this.a) {
++            for (ICrafting listener : this.listeners) {
++                listener.setContainerData(this, 0, this.a);
++            }
++            this.previousCost = this.a;
++        }
++    }
++
+     public void b(EntityHuman entityhuman) {
+         super.b(entityhuman);
++        if (this.customInventory) return; // Retain plugin-owned contents, as other custom inventories do.
+         if (!this.i.isClientSide) {
+             for (int i = 0; i < this.h.getSize(); ++i) {
+                 ItemStack itemstack = this.h.splitWithoutUpdate(i);
+diff --git a/src/main/java/net/minecraft/server/ContainerEnchantTable.java b/src/main/java/net/minecraft/server/ContainerEnchantTable.java
+index 5c473bef9a9fa2700ac665f17f4af84add29db2e..cb096cb7bcdefcb4030c435902a171a4bca17cb0 100644
+--- a/src/main/java/net/minecraft/server/ContainerEnchantTable.java
++++ b/src/main/java/net/minecraft/server/ContainerEnchantTable.java
+@@ -260,9 +260,13 @@ public class ContainerEnchantTable extends Container {
+                     }
+ 
+                     entityhuman.b(StatisticList.W);
++                    // PandaSpigot - Enchantments only change NBT, which the generic container
++                    // cache otherwise checks every 20 ticks. Send the completed transaction now.
++                    this.b.set(0, null);
+                     this.enchantSlots.update();
+                     this.f = entityhuman.cj();
+                     this.a(this.enchantSlots);
++                    this.b();
+                 }
+             }
+ 
+diff --git a/src/main/java/net/minecraft/server/Entity.java b/src/main/java/net/minecraft/server/Entity.java
+index e2b6f0a788fe56cacbadb457a7c65b3412a1b528..180dace3e8af42044d6a5bb7818804d89cea0a7f 100644
+--- a/src/main/java/net/minecraft/server/Entity.java
++++ b/src/main/java/net/minecraft/server/Entity.java
+@@ -122,7 +122,7 @@ public abstract class Entity implements ICommandListener {
+         int chunkY = MathHelper.floor(locY / 16.0D);
+         int chunkZ = MathHelper.floor(locZ / 16.0D);
+ 
+-        return ad && getChunkX() == chunkX && getChunkY() == chunkY || getChunkZ() == chunkZ;
++        return ad && getChunkX() == chunkX && getChunkY() == chunkY && getChunkZ() == chunkZ; // PandaSpigot - all chunk coordinates must match after a teleport
+     }
+     public int ae; public int getChunkX() { return ae; } // PAIL
+     public int af; public int getChunkY() { return af; } // PAIL
+diff --git a/src/main/java/net/minecraft/server/EntityArrow.java b/src/main/java/net/minecraft/server/EntityArrow.java
+index 1cfea4ba17c64ff6534d6898408ed9ddd3eb6fd6..534dbab9a7607267257eabf931e195e551d42abc 100644
+--- a/src/main/java/net/minecraft/server/EntityArrow.java
++++ b/src/main/java/net/minecraft/server/EntityArrow.java
+@@ -276,10 +276,13 @@ public class EntityArrow extends Entity implements IProjectile {
+                                 entityliving.o(entityliving.bv() + 1);
+                             }
+ 
+-                            if (this.knockbackStrength > 0) {
++                            com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig.KnockbackConfig knockback = entityliving.getKnockbackConfig();
++                            if (this.knockbackStrength > 0 && knockback.enabled) {
+                                 f3 = MathHelper.sqrt(this.motX * this.motX + this.motZ * this.motZ);
+                                 if (f3 > 0.0F) {
+-                                    movingobjectposition.entity.g(this.motX * (double) this.knockbackStrength * 0.6000000238418579D / (double) f3, 0.1D, this.motZ * (double) this.knockbackStrength * 0.6000000238418579D / (double) f3);
++                                    movingobjectposition.entity.g(this.motX * (double) this.knockbackStrength * 0.6000000238418579D / (double) f3 * knockback.arrowHorizontal,
++                                            0.1D * knockback.arrowVertical,
++                                            this.motZ * (double) this.knockbackStrength * 0.6000000238418579D / (double) f3 * knockback.arrowHorizontal);
+                                 }
+                             }
+ 
+diff --git a/src/main/java/net/minecraft/server/EntityEnderPearl.java b/src/main/java/net/minecraft/server/EntityEnderPearl.java
+index 319c0bc6f621d54ca36e6e2b210a308122f1e070..17b3a1004f84be4c8f2702e52b7ad17ac8f5cfc1 100644
+--- a/src/main/java/net/minecraft/server/EntityEnderPearl.java
++++ b/src/main/java/net/minecraft/server/EntityEnderPearl.java
+@@ -54,6 +54,8 @@ public class EntityEnderPearl extends EntityProjectile {
+                     location.setYaw(player.getLocation().getYaw());
+ 
+                     PlayerTeleportEvent teleEvent = new PlayerTeleportEvent(player, player.getLocation(), location, PlayerTeleportEvent.TeleportCause.ENDER_PEARL);
++                    // PandaSpigot - pearls must not bypass the world border; plugins may explicitly override the event
++                    if (this.world.getWorldBorder().b(location.getX(), location.getZ()) < 0.0D) teleEvent.setCancelled(true);
+                     Bukkit.getPluginManager().callEvent(teleEvent);
+ 
+                     if (!teleEvent.isCancelled() && !entityplayer.playerConnection.isDisconnected()) {
+diff --git a/src/main/java/net/minecraft/server/EntityFishingHook.java b/src/main/java/net/minecraft/server/EntityFishingHook.java
+index 6630761c1fcbd6c1588252cb2df28123f7577295..83d066522a6bb1528bd29b223ba2c20e021a6b69 100644
+--- a/src/main/java/net/minecraft/server/EntityFishingHook.java
++++ b/src/main/java/net/minecraft/server/EntityFishingHook.java
+@@ -61,7 +61,11 @@ public class EntityFishingHook extends Entity {
+         this.motX = (double) (-MathHelper.sin(this.yaw / 180.0F * 3.1415927F) * MathHelper.cos(this.pitch / 180.0F * 3.1415927F) * f);
+         this.motZ = (double) (MathHelper.cos(this.yaw / 180.0F * 3.1415927F) * MathHelper.cos(this.pitch / 180.0F * 3.1415927F) * f);
+         this.motY = (double) (-MathHelper.sin(this.pitch / 180.0F * 3.1415927F) * f);
+-        this.c(this.motX, this.motY, this.motZ, 1.5F, 1.0F);
++        com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig.FishingRodConfig rod = world.pandaSpigotConfig.fishingRod;
++        this.c(this.motX, this.motY, this.motZ, rod.launchSpeed, rod.randomTrajectory ? 1.0F : 0.0F);
++        this.motX *= rod.horizontalMultiplier;
++        this.motY *= rod.verticalMultiplier;
++        this.motZ *= rod.horizontalMultiplier;
+     }
+ 
+     protected void h() {}
+@@ -105,7 +109,8 @@ public class EntityFishingHook extends Entity {
+             if (!this.world.isClientSide) {
+                 ItemStack itemstack = this.owner.bZ();
+ 
+-                if (this.owner.dead || !this.owner.isAlive() || itemstack == null || itemstack.getItem() != Items.FISHING_ROD || this.h(this.owner) > 1024.0D) {
++                double maximumDistance = this.world.pandaSpigotConfig.fishingRod.maximumDistance;
++                if (this.owner.dead || !this.owner.isAlive() || itemstack == null || itemstack.getItem() != Items.FISHING_ROD || this.h(this.owner) > maximumDistance * maximumDistance) {
+                     this.die();
+                     this.owner.hookedFish = null;
+                     return;
+@@ -359,7 +364,7 @@ public class EntityFishingHook extends Entity {
+                 }
+ 
+                 d6 = d7 * 2.0D - 1.0D;
+-                this.motY += 0.03999999910593033D * d6;
++                this.motY += this.world.pandaSpigotConfig.fishingRod.gravity * d6;
+                 if (d7 > 0.0D) {
+                     f2 = (float) ((double) f2 * 0.9D);
+                     this.motY *= 0.8D;
+diff --git a/src/main/java/net/minecraft/server/EntityHuman.java b/src/main/java/net/minecraft/server/EntityHuman.java
+index 584a2aa09ff8e633f0091b9bca4c68deef252d58..6215391dd8bd63ca23e929ed1a9ae7b7d30408ce 100644
+--- a/src/main/java/net/minecraft/server/EntityHuman.java
++++ b/src/main/java/net/minecraft/server/EntityHuman.java
+@@ -1012,22 +1012,28 @@ public abstract class EntityHuman extends EntityLiving {
+                     if (flag2) {
+                         if (i > 0) {
+                             // PandaSpigot start - Configurable knockback
+-                            com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig.KnockbackConfig knockbackConfig = entity.world.pandaSpigotConfig.knockback;
+-                            entity.g(
+-                                    -MathHelper.sin(this.yaw * 3.1415927F / 180.0F) * (float) i * knockbackConfig.extraHorizontal,
+-                                    knockbackConfig.extraVertical,
+-                                    MathHelper.cos(this.yaw * 3.1415927F / 180.0F) * (float) i * knockbackConfig.extraHorizontal);
++                            com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig.KnockbackConfig knockbackConfig = entity instanceof EntityLiving
++                                    ? ((EntityLiving) entity).getKnockbackConfig() : entity.world.pandaSpigotConfig.getKnockbackProfile(null);
++                            if (knockbackConfig.enabled) {
++                                double extraHorizontal = knockbackConfig.extraHorizontal(this.random);
++                                entity.g(
++                                        -MathHelper.sin(this.yaw * 3.1415927F / 180.0F) * (float) i * extraHorizontal,
++                                        knockbackConfig.extraVertical(this.random),
++                                        MathHelper.cos(this.yaw * 3.1415927F / 180.0F) * (float) i * extraHorizontal);
++                            }
+                             // PandaSpigot end
+-                            this.motX *= 0.6D;
+-                            this.motZ *= 0.6D;
+-                            this.setSprinting(false);
++                            if (this.getKnockbackConfig().stopSprint) {
++                                this.motX *= 0.6D;
++                                this.motZ *= 0.6D;
++                                this.setSprinting(false);
++                            }
+                         }
+ 
+                         if (entity instanceof EntityPlayer && entity.velocityChanged) {
+                             // CraftBukkit start - Add Velocity Event
+                             boolean cancelled = false;
+                             Player player = (Player) entity.getBukkitEntity();
+-                            org.bukkit.util.Vector velocity = new Vector( d0, d1, d2 );
++                            org.bukkit.util.Vector velocity = new Vector(entity.motX, entity.motY, entity.motZ);
+ 
+                             PlayerVelocityEvent event = new PlayerVelocityEvent(player, velocity.clone());
+                             world.getServer().getPluginManager().callEvent(event);
+@@ -1042,11 +1048,12 @@ public abstract class EntityHuman extends EntityLiving {
+                                 if (entity.vehicle == null) {
+                                     ( (EntityPlayer) entity ).playerConnection.sendPacket( new PacketPlayOutEntityVelocity( entity ) ); // PandaSpigot - Do not send knockback packets while the player is in a vehicle
+                                 }
+-                                entity.velocityChanged = false;
+-                                entity.motX = d0;
+-                                entity.motY = d1;
+-                                entity.motZ = d2;
+                             }
++                            // PandaSpigot - A cancelled hit must not leak its velocity on a later tick.
++                            entity.velocityChanged = false;
++                            entity.motX = d0;
++                            entity.motY = d1;
++                            entity.motZ = d2;
+                             // CraftBukkit end
+                         }
+ 
+diff --git a/src/main/java/net/minecraft/server/EntityLiving.java b/src/main/java/net/minecraft/server/EntityLiving.java
+index 32752dfad24bc7883b1ab52e29834f1aa6fa60c6..7d6abf26b79409efa5c26f57991714c85369012a 100644
+--- a/src/main/java/net/minecraft/server/EntityLiving.java
++++ b/src/main/java/net/minecraft/server/EntityLiving.java
+@@ -376,29 +376,25 @@ public abstract class EntityLiving extends Entity {
+         nbttagcompound.setInt("HurtByTimestamp", this.hurtTimestamp);
+         nbttagcompound.setShort("DeathTime", (short) this.deathTicks);
+         nbttagcompound.setFloat("AbsorptionAmount", this.getAbsorptionHearts());
+-        ItemStack[] aitemstack = this.getEquipment();
+-        int i = aitemstack.length;
+-
+-        int j;
+-        ItemStack itemstack;
+-
+-        for (j = 0; j < i; ++j) {
+-            itemstack = aitemstack[j];
++        // PandaSpigot start - Only strip equipment modifiers that have actually been applied.
++        // The inventory can change (including being cleared on death) before the next tick.
++        // Using getEquipment() here would then save the previous weapon's damage permanently.
++        for (ItemStack itemstack : this.h) {
+             if (itemstack != null) {
+                 this.c.a(itemstack.B());
+             }
+         }
+ 
+-        nbttagcompound.set("Attributes", GenericAttributes.a(this.getAttributeMap()));
+-        aitemstack = this.getEquipment();
+-        i = aitemstack.length;
+-
+-        for (j = 0; j < i; ++j) {
+-            itemstack = aitemstack[j];
+-            if (itemstack != null) {
+-                this.c.b(itemstack.B());
++        try {
++            nbttagcompound.set("Attributes", GenericAttributes.a(this.getAttributeMap()));
++        } finally {
++            for (ItemStack itemstack : this.h) {
++                if (itemstack != null) {
++                    this.c.b(itemstack.B());
++                }
+             }
+         }
++        // PandaSpigot end
+ 
+         if (!this.effects.isEmpty()) {
+             NBTTagList nbttaglist = new NBTTagList();
+@@ -803,7 +799,7 @@ public abstract class EntityLiving extends Entity {
+                         }
+ 
+                         this.aw = (float) (MathHelper.b(d1, d0) * 180.0D / 3.1415927410125732D - (double) this.yaw);
+-                        this.a(entity, f, d0, d1);
++                        this.applyKnockback(entity, f, d0, d1, damagesource.i());
+                     } else {
+                         this.aw = (float) ((int) (Math.random() * 2.0D) * 180);
+                     }
+@@ -833,7 +829,12 @@ public abstract class EntityLiving extends Entity {
+     }
+ 
+     public void b(ItemStack itemstack) {
+-        this.makeSound("random.break", 0.8F, 0.8F + this.world.random.nextFloat() * 0.4F);
++        // PandaSpigot - The client does not predict server-side tool breaks. Include its owner.
++        if (this instanceof EntityHuman) {
++            this.world.makeSound(this, "random.break", 0.8F, 0.8F + this.world.random.nextFloat() * 0.4F);
++        } else {
++            this.makeSound("random.break", 0.8F, 0.8F + this.world.random.nextFloat() * 0.4F);
++        }
+ 
+         for (int i = 0; i < 5; ++i) {
+             Vec3D vec3d = new Vec3D(((double) this.random.nextFloat() - 0.5D) * 0.1D, Math.random() * 0.1D + 0.1D, 0.0D);
+@@ -846,7 +847,15 @@ public abstract class EntityLiving extends Entity {
+             vec3d1 = vec3d1.a(-this.pitch * 3.1415927F / 180.0F);
+             vec3d1 = vec3d1.b(-this.yaw * 3.1415927F / 180.0F);
+             vec3d1 = vec3d1.add(this.locX, this.locY + (double) this.getHeadHeight(), this.locZ);
+-            this.world.addParticle(EnumParticle.ITEM_CRACK, vec3d1.a, vec3d1.b, vec3d1.c, vec3d.a, vec3d.b + 0.05D, vec3d.c, new int[] { Item.getId(itemstack.getItem())});
++            // PandaSpigot - World.addParticle is a client-only callback in this version.
++            if (this.world instanceof WorldServer) {
++                ((WorldServer) this.world).sendParticles(this instanceof EntityPlayer ? (EntityPlayer) this : null,
++                        EnumParticle.ITEM_CRACK, false, vec3d1.a, vec3d1.b, vec3d1.c, 0,
++                        vec3d.a, vec3d.b + 0.05D, vec3d.c, 1.0D, Item.getId(itemstack.getItem()), itemstack.getData());
++            } else {
++                this.world.addParticle(EnumParticle.ITEM_CRACK, vec3d1.a, vec3d1.b, vec3d1.c,
++                        vec3d.a, vec3d.b + 0.05D, vec3d.c, Item.getId(itemstack.getItem()), itemstack.getData());
++            }
+         }
+ 
+     }
+@@ -894,21 +903,50 @@ public abstract class EntityLiving extends Entity {
+ 
+     protected void dropEquipment(boolean flag, int i) {}
+ 
++    public String knockbackProfile;
++
++    public com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig.KnockbackConfig getKnockbackConfig() {
++        return this.world.pandaSpigotConfig.getKnockbackProfile(
++                this.world.pandaSpigotConfig.getKnockbackProfileName(this.knockbackProfile));
++    }
++
+     public void a(Entity entity, float f, double d0, double d1) {
++        this.applyKnockback(entity, f, d0, d1, null);
++    }
++
++    private void applyKnockback(Entity entity, float f, double d0, double d1, Entity projectile) {
++        com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig.KnockbackConfig knockbackConfig = this.getKnockbackConfig();
++        if (!knockbackConfig.enabled) return;
++        double horizontalMultiplier = 1.0D;
++        double verticalMultiplier = 1.0D;
++        if (projectile instanceof EntityArrow) {
++            horizontalMultiplier = knockbackConfig.arrowHorizontal;
++            verticalMultiplier = knockbackConfig.arrowVertical;
++        } else if (projectile instanceof EntitySnowball) {
++            horizontalMultiplier = knockbackConfig.snowballHorizontal;
++            verticalMultiplier = knockbackConfig.snowballVertical;
++        } else if (projectile instanceof EntityEgg) {
++            horizontalMultiplier = knockbackConfig.eggHorizontal;
++            verticalMultiplier = knockbackConfig.eggVertical;
++        } else if (projectile instanceof EntityFishingHook) {
++            horizontalMultiplier = knockbackConfig.rodHorizontal;
++            verticalMultiplier = knockbackConfig.rodVertical;
++        }
+         if (this.random.nextDouble() >= this.getAttributeInstance(GenericAttributes.c).getValue()) {
+-            this.ai = true;
+             // PandaSpigot start - Configurable knockback
+-            com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig.KnockbackConfig knockbackConfig = entity.world.pandaSpigotConfig.knockback;
+             double magnitude = MathHelper.sqrt(d0 * d0 + d1 * d1);
++            if (magnitude == 0.0D || !Double.isFinite(magnitude)) return;
++            this.ai = true;
+     
+-            double friction = knockbackConfig.friction;
+-            this.motX /= friction;
+-            this.motY /= friction;
+-            this.motZ /= friction;
++            double horizontalFriction = knockbackConfig.frictionHorizontal(this.random);
++            this.motX /= horizontalFriction;
++            this.motY /= knockbackConfig.frictionVertical(this.random);
++            this.motZ /= horizontalFriction;
+     
+-            this.motX -= d0 / magnitude * knockbackConfig.horizontal;
+-            this.motY += knockbackConfig.vertical;
+-            this.motZ -= d1 / magnitude * knockbackConfig.horizontal;
++            double horizontal = knockbackConfig.horizontal(this.random) * horizontalMultiplier;
++            this.motX -= d0 / magnitude * horizontal;
++            this.motY += knockbackConfig.vertical(this.random) * verticalMultiplier;
++            this.motZ -= d1 / magnitude * horizontal;
+     
+             if (this.motY > knockbackConfig.verticalLimit) {
+                 this.motY = knockbackConfig.verticalLimit;
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+index 6f804d5b1eaa085366b5213a98bc412cada1f078..3aaecfe4369913b0bc2fb2daf83c550d9076a9ea 100644
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -65,9 +65,17 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+     // CraftBukkit end
+     // Spigot start
+     public boolean collidesWithEntities = true;
+-    public int viewDistance; // PaperSpigot - Player view distance API
++    public int viewDistance = -1; // PandaSpigot - keep the legacy field; -1 follows the current world's distance
+     private int containerUpdateDelay; // PaperSpigot
+ 
++    public int getViewDistance() {
++        return this.viewDistance == -1 ? ((WorldServer) this.world).getPlayerChunkMap().getViewDistance() : MathHelper.clamp(this.viewDistance, 3, 32);
++    }
++
++    public void setViewDistance(int viewDistance) {
++        this.viewDistance = viewDistance == -1 ? -1 : MathHelper.clamp(viewDistance, 3, 32);
++    }
++
+     @Override
+     public boolean ad()
+     {
+@@ -83,7 +91,6 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+ 
+     public EntityPlayer(MinecraftServer minecraftserver, WorldServer worldserver, GameProfile gameprofile, PlayerInteractManager playerinteractmanager) {
+         super(worldserver, gameprofile);
+-        this.viewDistance = world.spigotConfig.viewDistance; // PaperSpigot - Player view distance API
+         playerinteractmanager.player = this;
+         this.playerInteractManager = playerinteractmanager;
+         BlockPosition blockposition = getSpawnPoint(minecraftserver, worldserver); // PandaSpigot - Split spawn point logic
+@@ -241,6 +248,26 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+             this.playerConnection.sendPacket(new PacketPlayOutEntityDestroy(aint));
+         }
+ 
++        this.sendQueuedChunks(); // PandaSpigot - also flush spawn terrain before the first position packet
++
++        Entity entity = this.C();
++
++        if (entity != this) {
++            if (!entity.isAlive()) {
++                this.setSpectatorTarget(this);
++            } else {
++                this.setLocation(entity.locX, entity.locY, entity.locZ, entity.yaw, entity.pitch);
++                this.server.getPlayerList().d(this);
++                if (this.isSneaking()) {
++                    this.setSpectatorTarget(this);
++                }
++            }
++        }
++
++    }
++
++    // PandaSpigot start
++    public void sendQueuedChunks() {
+         if (!this.chunkCoordIntPairQueue.isEmpty()) {
+             ArrayList arraylist = Lists.newArrayList();
+             Iterator iterator1 = this.chunkCoordIntPairQueue.iterator();
+@@ -290,21 +317,8 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+             }
+         }
+ 
+-        Entity entity = this.C();
+-
+-        if (entity != this) {
+-            if (!entity.isAlive()) {
+-                this.setSpectatorTarget(this);
+-            } else {
+-                this.setLocation(entity.locX, entity.locY, entity.locZ, entity.yaw, entity.pitch);
+-                this.server.getPlayerList().d(this);
+-                if (this.isSneaking()) {
+-                    this.setSpectatorTarget(this);
+-                }
+-            }
+-        }
+-
+     }
++    // PandaSpigot end
+ 
+     public void l() {
+         try {
+diff --git a/src/main/java/net/minecraft/server/EntityTracker.java b/src/main/java/net/minecraft/server/EntityTracker.java
+index cb72b36725927272fddfdad929b268a7b06140ac..b17e00d9d277d4d0a726d6b3158d2e7d59e865db 100644
+--- a/src/main/java/net/minecraft/server/EntityTracker.java
++++ b/src/main/java/net/minecraft/server/EntityTracker.java
+@@ -168,6 +168,7 @@ public class EntityTracker {
+     }
+ 
+     public void updatePlayers() {
++        if (this.world.pandaSpigotConfig.performance.disableEntityTrackingUpdates) return;
+         ArrayList arraylist = Lists.newArrayList();
+         Iterator iterator = this.c.iterator();
+ 
+diff --git a/src/main/java/net/minecraft/server/ItemBucket.java b/src/main/java/net/minecraft/server/ItemBucket.java
+index b62ea42fc40f0e2000f7f408b3f4d9424b1be4c1..98486e9f990d0a9655845b1071556a5580e6ec79 100644
+--- a/src/main/java/net/minecraft/server/ItemBucket.java
++++ b/src/main/java/net/minecraft/server/ItemBucket.java
+@@ -23,6 +23,7 @@ public class ItemBucket extends Item {
+         boolean flag = this.a == Blocks.AIR;
+         MovingObjectPosition movingobjectposition = this.a(world, entityhuman, flag);
+ 
++        try {
+         if (movingobjectposition == null) {
+             return itemstack;
+         } else {
+@@ -114,6 +115,17 @@ public class ItemBucket extends Item {
+ 
+             return itemstack;
+         }
++        } finally {
++            // Bucket use is predicted locally. Also correct rejected/cancelled operations,
++            // which do not dirty a block and therefore produce no ordinary world update.
++            if (entityhuman instanceof EntityPlayer && movingobjectposition != null
++                    && movingobjectposition.type == MovingObjectPosition.EnumMovingObjectType.BLOCK) {
++                PlayerConnection connection = ((EntityPlayer) entityhuman).playerConnection;
++                BlockPosition hit = movingobjectposition.a();
++                connection.sendPacket(new PacketPlayOutBlockChange(world, hit));
++                connection.sendPacket(new PacketPlayOutBlockChange(world, hit.shift(movingobjectposition.direction)));
++            }
++        }
+     }
+ 
+     // CraftBukkit - added ob.ItemStack result - TODO: Is this... the right way to handle this?
+diff --git a/src/main/java/net/minecraft/server/LegacyPingHandler.java b/src/main/java/net/minecraft/server/LegacyPingHandler.java
+index 07f6940bc26b910bf332e2ceb17b122e5fe1dae5..c32fae965b98b5cffbb8d447b0d1c693e066b733 100644
+--- a/src/main/java/net/minecraft/server/LegacyPingHandler.java
++++ b/src/main/java/net/minecraft/server/LegacyPingHandler.java
+@@ -93,7 +93,7 @@ public class LegacyPingHandler extends ChannelInboundHandlerAdapter {
+                         // PandaSpigot start - Backport PaperServerListPingEvent
+                         InetSocketAddress virtualHost = com.destroystokyo.paper.network.PaperNetworkClient.prepareVirtualHost(new String(host, Charsets.UTF_16BE), port);
+                         event = com.destroystokyo.paper.network.PaperLegacyStatusClient.processRequest(
+-                            minecraftserver, (InetSocketAddress) channelhandlercontext.channel().remoteAddress(), protocolVersion, virtualHost);
++                            minecraftserver, inetsocketaddress, protocolVersion, virtualHost);
+ 
+                         if (event == null) {
+                             channelhandlercontext.close();
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 90717eeb158b29b0e96b3eb9949b0a6ffc4bd7e9..e3bcd006a7450cc9fc2418a372fe2447aa501428 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -68,9 +68,9 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+     private int u = -1;
+     public WorldServer[] worldServer;
+     private PlayerList v;
+-    private boolean isRunning = true;
+-    private boolean isRestarting = false;
+-    private boolean isStopped;
++    private volatile boolean isRunning = true;
++    private volatile boolean isRestarting = false;
++    private volatile boolean isStopped;
+     private int ticks;
+     protected final Proxy e;
+     public String f;
+@@ -125,6 +125,12 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+     private static final long OVERLOADED_WARNING_INTERVAL_NANOS = 10L * TimeUnit.SECONDS.toNanos(1L);
+     private static final int OVERLOADED_TICKS_WARNING_INTERVAL = 100;
+     private static final long NANOSECONDS_PER_TICK = TimeUnit.SECONDS.toNanos(1L) / 20L;
++    private long currentTickIntervalNanos = NANOSECONDS_PER_TICK;
++    private final com.hpfxd.pandaspigot.TickTimeSampler tickTimeSampler = new com.hpfxd.pandaspigot.TickTimeSampler();
++
++    public double getMspt() {
++        return this.tickTimeSampler.getMspt();
++    }
+     private static final long NANOSECONDS_MILLI_PER_MILLISECOND = TimeUnit.MILLISECONDS.toNanos(1L);
+     private boolean mayHaveDelayedTasks;
+     private long delayedTasksMaxNextTickTime;
+@@ -527,8 +533,8 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+     }
+ 
+     public void safeShutdown(boolean isRestarting) {
+-        this.isRunning = false;
+         this.isRestarting = isRestarting;
++        this.isRunning = false;
+     }
+ 
+     public boolean isRestarting() {
+@@ -614,12 +620,18 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+                 while (this.isRunning) {
+                     // PandaSpigot start - Modern Tick Loop
+                     long behindTime = (curTime = System.nanoTime()) - this.ab;
+-                    if (behindTime > OVERLOADED_THRESHOLD_NANOS + OVERLOADED_TICKS_THRESHOLD * NANOSECONDS_PER_TICK && this.ab - this.R >= OVERLOADED_WARNING_INTERVAL_NANOS + OVERLOADED_TICKS_WARNING_INTERVAL * NANOSECONDS_PER_TICK) {
+-                        long behindTicks = behindTime / NANOSECONDS_PER_TICK;
++                    long configuredInterval = com.hpfxd.pandaspigot.config.PandaSpigotConfig.get().performance.tickIntervalNanos(this.getPlayerList().getPlayerCount());
++                    if (configuredInterval != this.currentTickIntervalNanos) {
++                        this.currentTickIntervalNanos = configuredInterval;
++                        this.ab = curTime; // Rate changes must not produce a catch-up burst.
++                        behindTime = 0;
++                    }
++                    if (behindTime > OVERLOADED_THRESHOLD_NANOS + OVERLOADED_TICKS_THRESHOLD * this.currentTickIntervalNanos && this.ab - this.R >= OVERLOADED_WARNING_INTERVAL_NANOS + OVERLOADED_TICKS_WARNING_INTERVAL * this.currentTickIntervalNanos) {
++                        long behindTicks = behindTime / this.currentTickIntervalNanos;
+                         if (server.getWarnOnOverload()) { // CraftBukkit
+                             LOGGER.warn("Can't keep up! Is the server overloaded? Running {}ms or {} ticks behind", behindTime / NANOSECONDS_MILLI_PER_MILLISECOND, behindTicks);
+                         }
+-                        this.ab += behindTicks * NANOSECONDS_PER_TICK;
++                        this.ab += behindTicks * this.currentTickIntervalNanos;
+                         this.R = this.ab;
+                     }
+                     /*
+@@ -664,11 +676,11 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+                     lastTick = curTime;
+ 
+                     // PandaSpigot start - Modern Tick Loop
+-                    this.ab += NANOSECONDS_PER_TICK;
++                    this.ab += this.currentTickIntervalNanos;
+ 
+                     this.A();
+                     this.mayHaveDelayedTasks = true;
+-                    this.delayedTasksMaxNextTickTime = Math.max(getNanoTime() + NANOSECONDS_PER_TICK, this.ab);
++                    this.delayedTasksMaxNextTickTime = Math.max(getNanoTime() + this.currentTickIntervalNanos, this.ab);
+                     this.waitUntilNextTick();
+                     // PandaSpigot end
+ 
+@@ -870,10 +882,11 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+         org.spigotmc.WatchdogThread.tick(); // Spigot
+         // PandaSpigot start - Add ServerTickEndEvent
+         long endTime = System.nanoTime();
+-        long remaining = (TICK_TIME - (endTime - lastTick));
++        long remaining = (this.currentTickIntervalNanos - (endTime - lastTick));
+         new com.destroystokyo.paper.event.server.ServerTickEndEvent(this.ticks, ((double)(endTime - lastTick) / 1000000D), remaining).callEvent();
+         // PandaSpigot end
+         co.aikar.timings.TimingsManager.FULL_SERVER_TICK.stopTiming(); // Spigot
++        this.tickTimeSampler.record(System.nanoTime() - i);
+     }
+ 
+     public void B() {
+diff --git a/src/main/java/net/minecraft/server/PacketDataSerializer.java b/src/main/java/net/minecraft/server/PacketDataSerializer.java
+index 09b8fa11efa326345b3b4eaf952676f4841f8115..4f610b4f86f739d25ba1bc28dc290a734419c84f 100644
+--- a/src/main/java/net/minecraft/server/PacketDataSerializer.java
++++ b/src/main/java/net/minecraft/server/PacketDataSerializer.java
+@@ -172,6 +172,16 @@ public class PacketDataSerializer extends ByteBuf {
+                 CraftItemStack.setItemMeta(itemstack, CraftItemStack.getItemMeta(itemstack));
+                 // Spigot end
+                 nbttagcompound = itemstack.getTag();
++                // PandaSpigot start - The 1.8 client cannot edit a zero-page writable book.
++                // Books with unrelated metadata (for example an anvil name) need a blank page.
++                // This stack is a copy; keep the authoritative item and Bukkit BookMeta unchanged.
++                if (itemstack.getItem() == Items.WRITABLE_BOOK && nbttagcompound != null
++                        && nbttagcompound.getList("pages", 8).size() == 0) {
++                    NBTTagList pages = new NBTTagList();
++                    pages.add(new NBTTagString(""));
++                    nbttagcompound.set("pages", pages);
++                }
++                // PandaSpigot end
+             }
+ 
+             this.a(nbttagcompound);
+diff --git a/src/main/java/net/minecraft/server/PacketPlayInUpdateSign.java b/src/main/java/net/minecraft/server/PacketPlayInUpdateSign.java
+index 80d1203a833cdca18c42c6864baf4883e1163654..c0f073c8ecc51394457cff7c9599bbcd61fee714 100644
+--- a/src/main/java/net/minecraft/server/PacketPlayInUpdateSign.java
++++ b/src/main/java/net/minecraft/server/PacketPlayInUpdateSign.java
+@@ -1,6 +1,10 @@
+ package net.minecraft.server;
+ 
+ import java.io.IOException;
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import com.google.gson.JsonParser;
++import io.netty.handler.codec.DecoderException;
+ 
+ public class PacketPlayInUpdateSign implements Packet<PacketListenerPlayIn> {
+ 
+@@ -16,11 +20,48 @@ public class PacketPlayInUpdateSign implements Packet<PacketListenerPlayIn> {
+ 
+         for (int i = 0; i < 4; ++i) {
+             String s = packetdataserializer.c(384);
+-            IChatBaseComponent ichatbasecomponent = IChatBaseComponent.ChatSerializer.a(s);
++            this.b[i] = new ChatComponentText(readLiteralLine(s));
++        }
++
++    }
+ 
+-            this.b[i] = ichatbasecomponent;
++    // Client sign edits contain literal text. Do not construct rich components here:
++    // resolving nested translations can expand a short packet before the sign length limit runs.
++    static String readLiteralLine(String json) {
++        try {
++            StringBuilder text = new StringBuilder();
++            appendLiteral(new JsonParser().parse(json), text);
++            return text.toString();
++        } catch (RuntimeException exception) {
++            throw new DecoderException("Invalid sign text", exception);
+         }
++    }
+ 
++    private static void appendLiteral(JsonElement element, StringBuilder text) {
++        if (element.isJsonPrimitive()) {
++            text.append(element.getAsString());
++        } else if (element.isJsonArray()) {
++            if (element.getAsJsonArray().size() == 0) {
++                throw new IllegalArgumentException("Empty sign component");
++            }
++            for (JsonElement child : element.getAsJsonArray()) {
++                appendLiteral(child, text);
++            }
++        } else if (element.isJsonObject()) {
++            JsonObject object = element.getAsJsonObject();
++            if (!object.has("text") || !object.get("text").isJsonPrimitive()) {
++                throw new IllegalArgumentException("Sign text must be literal");
++            }
++            text.append(object.get("text").getAsString());
++            if (object.has("extra")) {
++                if (!object.get("extra").isJsonArray()) {
++                    throw new IllegalArgumentException("Invalid sign siblings");
++                }
++                appendLiteral(object.get("extra"), text);
++            }
++        } else {
++            throw new IllegalArgumentException("Missing sign text");
++        }
+     }
+ 
+     @Override
+diff --git a/src/main/java/net/minecraft/server/PacketPlayOutTitle.java b/src/main/java/net/minecraft/server/PacketPlayOutTitle.java
+index 98080450b4fa91129d96022b1175b93fb54f1d23..d240b182128b0752beb077665e8dd972afe2a123 100644
+--- a/src/main/java/net/minecraft/server/PacketPlayOutTitle.java
++++ b/src/main/java/net/minecraft/server/PacketPlayOutTitle.java
+@@ -4,6 +4,16 @@ import java.io.IOException;
+ 
+ public class PacketPlayOutTitle implements Packet<PacketListenerPlayOut> {
+ 
++    // The client adds all three phases using int arithmetic, including retained phases.
++    public static final int MAX_TITLE_TICKS = Integer.MAX_VALUE / 3;
++
++    public static int durationToTicks(java.time.Duration duration) {
++        if (duration.isNegative()) return -1;
++        long seconds = duration.getSeconds();
++        if (seconds > MAX_TITLE_TICKS / 20) return MAX_TITLE_TICKS;
++        return (int) Math.min(MAX_TITLE_TICKS, seconds * 20 + duration.getNano() / 50000000);
++    }
++
+     private EnumTitleAction a;
+     private IChatBaseComponent b;
+     private int c;
+@@ -72,9 +82,9 @@ public class PacketPlayOutTitle implements Packet<PacketListenerPlayOut> {
+         }
+ 
+         if (this.a == EnumTitleAction.TIMES) {
+-            packetdataserializer.writeInt(this.c);
+-            packetdataserializer.writeInt(this.d);
+-            packetdataserializer.writeInt(this.e);
++            packetdataserializer.writeInt(Math.min(this.c, MAX_TITLE_TICKS));
++            packetdataserializer.writeInt(Math.min(this.d, MAX_TITLE_TICKS));
++            packetdataserializer.writeInt(Math.min(this.e, MAX_TITLE_TICKS));
+         }
+ 
+     }
+diff --git a/src/main/java/net/minecraft/server/PathfinderNormal.java b/src/main/java/net/minecraft/server/PathfinderNormal.java
+index 629aa160f55894960e5f3c3d10e131f5eee3bd5a..c148cfacbbb3ff2e5e8ea406946884098a002024 100644
+--- a/src/main/java/net/minecraft/server/PathfinderNormal.java
++++ b/src/main/java/net/minecraft/server/PathfinderNormal.java
+@@ -37,7 +37,19 @@ public class PathfinderNormal extends PathfinderAbstract {
+             i = MathHelper.floor(entity.getBoundingBox().b + 0.5D);
+         }
+ 
+-        return this.a(MathHelper.floor(entity.getBoundingBox().a), i, MathHelper.floor(entity.getBoundingBox().c));
++        // PandaSpigot start - small mobs beside fences can have a blocked grid corner despite a clear centre
++        int x = MathHelper.floor(entity.getBoundingBox().a);
++        int z = MathHelper.floor(entity.getBoundingBox().c);
++        if (entity.width < 1.0F && this.a(entity, x, i, z) <= 0) {
++            int centerX = MathHelper.floor(entity.locX);
++            int centerZ = MathHelper.floor(entity.locZ);
++            if (this.a(entity, centerX, i, centerZ) > 0) {
++                x = centerX;
++                z = centerZ;
++            }
++        }
++        return this.a(x, i, z);
++        // PandaSpigot end
+     }
+ 
+     public PathPoint a(Entity entity, double d0, double d1, double d2) {
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkMap.java b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+index 6a489b4514d565b47d930a6ed1abf94cd863cf54..9ef7f7c0db2aa4ad601e54218d8c9fbb5e9571c0 100644
+--- a/src/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -42,6 +42,13 @@ public class PlayerChunkMap {
+         return this.world;
+     }
+ 
++    public int getViewDistance() { return this.g; } // PandaSpigot
++
++    // A player may already reference the destination world while being removed from this map.
++    int getViewDistance(EntityPlayer player) {
++        return player.viewDistance == -1 ? this.g : MathHelper.clamp(player.viewDistance, 3, 32);
++    }
++
+     // PandaSpigot start - Alternative Chunk Ticking Selection
+     public Iterator<Chunk> getTickableChunks() {
+         final Iterator<PlayerChunk> iterator = this.f.iterator();
+@@ -161,8 +168,10 @@ public class PlayerChunkMap {
+     }
+ 
+     public void addPlayer(EntityPlayer entityplayer) {
+-        int i = (int) entityplayer.locX >> 4;
+-        int j = (int) entityplayer.locZ >> 4;
++        int i = MathHelper.floor(entityplayer.locX) >> 4;
++        int j = MathHelper.floor(entityplayer.locZ) >> 4;
++
++        this.world.chunkProviderServer.getChunkAt(i, j); // PandaSpigot - the spawn chunk must precede already-loaded distant chunks
+ 
+         entityplayer.d = entityplayer.locX;
+         entityplayer.e = entityplayer.locZ;
+@@ -171,8 +180,8 @@ public class PlayerChunkMap {
+         List<ChunkCoordIntPair> chunkList = new LinkedList<ChunkCoordIntPair>();
+ 
+         // PaperSpigot start - Player view distance API
+-        for (int k = i - entityplayer.viewDistance; k <= i + entityplayer.viewDistance; ++k) {
+-            for (int l = j - entityplayer.viewDistance; l <= j + entityplayer.viewDistance; ++l) {
++        for (int k = i - this.getViewDistance(entityplayer); k <= i + this.getViewDistance(entityplayer); ++k) {
++            for (int l = j - this.getViewDistance(entityplayer); l <= j + this.getViewDistance(entityplayer); ++l) {
+         // PaperSpigot end
+                 chunkList.add(new ChunkCoordIntPair(k, l));
+             }
+@@ -191,9 +200,9 @@ public class PlayerChunkMap {
+     public void b(EntityPlayer entityplayer) {
+         ArrayList arraylist = Lists.newArrayList(entityplayer.chunkCoordIntPairQueue);
+         int i = 0;
+-        int j = entityplayer.viewDistance; // PaperSpigot - Player view distance API
+-        int k = (int) entityplayer.locX >> 4;
+-        int l = (int) entityplayer.locZ >> 4;
++        int j = this.getViewDistance(entityplayer); // PaperSpigot - Player view distance API
++        int k = MathHelper.floor(entityplayer.locX) >> 4;
++        int l = MathHelper.floor(entityplayer.locZ) >> 4;
+         int i1 = 0;
+         int j1 = 0;
+         ChunkCoordIntPair chunkcoordintpair = this.a(k, l, true).location;
+@@ -234,12 +243,12 @@ public class PlayerChunkMap {
+     }
+ 
+     public void removePlayer(EntityPlayer entityplayer) {
+-        int i = (int) entityplayer.d >> 4;
+-        int j = (int) entityplayer.e >> 4;
++        int i = MathHelper.floor(entityplayer.d) >> 4;
++        int j = MathHelper.floor(entityplayer.e) >> 4;
+ 
+         // PaperSpigot start - Player view distance API
+-        for (int k = i - entityplayer.viewDistance; k <= i + entityplayer.viewDistance; ++k) {
+-            for (int l = j - entityplayer.viewDistance; l <= j + entityplayer.viewDistance; ++l) {
++        for (int k = i - this.getViewDistance(entityplayer); k <= i + this.getViewDistance(entityplayer); ++k) {
++            for (int l = j - this.getViewDistance(entityplayer); l <= j + this.getViewDistance(entityplayer); ++l) {
+         // PaperSpigot end
+                 PlayerChunkMap.PlayerChunk playerchunkmap_playerchunk = this.a(k, l, false);
+ 
+@@ -260,16 +269,16 @@ public class PlayerChunkMap {
+     }
+ 
+     public void movePlayer(EntityPlayer entityplayer) {
+-        int i = (int) entityplayer.locX >> 4;
+-        int j = (int) entityplayer.locZ >> 4;
++        int i = MathHelper.floor(entityplayer.locX) >> 4;
++        int j = MathHelper.floor(entityplayer.locZ) >> 4;
+         double d0 = entityplayer.d - entityplayer.locX;
+         double d1 = entityplayer.e - entityplayer.locZ;
+         double d2 = d0 * d0 + d1 * d1;
+ 
+         if (d2 >= 64.0D) {
+-            int k = (int) entityplayer.d >> 4;
+-            int l = (int) entityplayer.e >> 4;
+-            int i1 = entityplayer.viewDistance; // PaperSpigot - Player view distance API
++            int k = MathHelper.floor(entityplayer.d) >> 4;
++            int l = MathHelper.floor(entityplayer.e) >> 4;
++            int i1 = this.getViewDistance(entityplayer); // PaperSpigot - Player view distance API
+             int j1 = i - k;
+             int k1 = j - l;
+             List<ChunkCoordIntPair> chunksToLoad = new LinkedList<ChunkCoordIntPair>(); // CraftBukkit
+@@ -312,56 +321,41 @@ public class PlayerChunkMap {
+     public boolean a(EntityPlayer entityplayer, int i, int j) {
+         PlayerChunkMap.PlayerChunk playerchunkmap_playerchunk = this.a(i, j, false);
+ 
+-        return playerchunkmap_playerchunk != null && playerchunkmap_playerchunk.b.contains(entityplayer) && !entityplayer.chunkCoordIntPairQueue.contains(playerchunkmap_playerchunk.location);
++        return playerchunkmap_playerchunk != null && playerchunkmap_playerchunk.loaded && playerchunkmap_playerchunk.b.contains(entityplayer) && !entityplayer.chunkCoordIntPairQueue.contains(playerchunkmap_playerchunk.location); // PandaSpigot - a queued async load has not been sent
+     }
+ 
+     public void a(int i) {
+         i = MathHelper.clamp(i, 3, 32);
+         if (i != this.g) {
+-            int j = i - this.g;
+-            ArrayList arraylist = Lists.newArrayList(this.managedPlayers);
+-            Iterator iterator = arraylist.iterator();
+-
+-            while (iterator.hasNext()) {
+-                EntityPlayer entityplayer = (EntityPlayer) iterator.next();
+-                int k = (int) entityplayer.locX >> 4;
+-                int l = (int) entityplayer.locZ >> 4;
+-                int i1;
+-                int j1;
+-
+-                if (j > 0) {
+-                    for (i1 = k - i; i1 <= k + i; ++i1) {
+-                        for (j1 = l - i; j1 <= l + i; ++j1) {
+-                            PlayerChunkMap.PlayerChunk playerchunkmap_playerchunk = this.a(i1, j1, true);
+-
+-                            if (!playerchunkmap_playerchunk.b.contains(entityplayer)) {
+-                                playerchunkmap_playerchunk.a(entityplayer);
+-                            }
+-                        }
+-                    }
+-                } else {
+-                    for (i1 = k - this.g; i1 <= k + this.g; ++i1) {
+-                        for (j1 = l - this.g; j1 <= l + this.g; ++j1) {
+-                            if (!this.a(i1, j1, k, l, i)) {
+-                                this.a(i1, j1, true).b(entityplayer);
+-                            }
+-                        }
+-                    }
++            // PandaSpigot start - explicit player overrides must survive world distance changes
++            for (EntityPlayer player : Lists.newArrayList(this.managedPlayers)) {
++                if (player.viewDistance == -1) {
++                    this.updateViewDistance(player, this.g, i);
+                 }
+             }
+-
+             this.g = i;
++            // PandaSpigot end
+         }
+     }
+ 
+     // PaperSpigot start - Player view distance API
+-    public void updateViewDistance(EntityPlayer player, int viewDistance) {
+-        viewDistance = MathHelper.clamp(viewDistance, 3, 32);
+-        if (viewDistance != player.viewDistance) {
+-            int cx = (int) player.locX >> 4;
+-            int cz = (int) player.locZ >> 4;
++    public void updateViewDistance(EntityPlayer player, int requestedDistance) {
++        // PandaSpigot start - -1 follows the world, including after a world transfer
++        int viewDistance = requestedDistance == -1 ? this.g : MathHelper.clamp(requestedDistance, 3, 32);
++        if (this.managedPlayers.contains(player)) {
++            this.updateViewDistance(player, this.getViewDistance(player), viewDistance);
++        }
++        player.setViewDistance(requestedDistance);
++        Collections.sort(player.chunkCoordIntPairQueue, new ChunkCoordComparator(player));
++    }
++
++    private void updateViewDistance(EntityPlayer player, int oldViewDistance, int viewDistance) {
++        if (viewDistance != oldViewDistance) {
++            // Use the subscription centre; movement may not have reached its update threshold yet.
++            int cx = MathHelper.floor(player.d) >> 4;
++            int cz = MathHelper.floor(player.e) >> 4;
+ 
+-            if (viewDistance - player.viewDistance > 0) {
++            if (viewDistance > oldViewDistance) {
+                 for (int x = cx - viewDistance; x <= cx + viewDistance; ++x) {
+                     for (int z = cz - viewDistance; z <= cz + viewDistance; ++z) {
+                         PlayerChunkMap.PlayerChunk playerchunkmap_playerchunk = this.a(x, z, true);
+@@ -372,18 +366,18 @@ public class PlayerChunkMap {
+                     }
+                 }
+             } else {
+-                for (int x = cx - player.viewDistance; x <= cx + player.viewDistance; ++x) {
+-                    for (int z = cz - player.viewDistance; z <= cz + player.viewDistance; ++z) {
++                for (int x = cx - oldViewDistance; x <= cx + oldViewDistance; ++x) {
++                    for (int z = cz - oldViewDistance; z <= cz + oldViewDistance; ++z) {
+                         if (!this.a(x, z, cx, cz, viewDistance)) {
+-                            this.a(x, z, true).b(player);
++                            PlayerChunk chunk = this.a(x, z, false);
++                            if (chunk != null) chunk.b(player);
+                         }
+                     }
+                 }
+             }
+-
+-            player.viewDistance = viewDistance;
+         }
+     }
++    // PandaSpigot end
+     // PaperSpigot end
+ 
+     public static int getFurthestViewableBlock(int i) {
+@@ -621,8 +615,8 @@ public class PlayerChunkMap {
+         private int z;
+ 
+         public ChunkCoordComparator (EntityPlayer entityplayer) {
+-            x = (int) entityplayer.locX >> 4;
+-            z = (int) entityplayer.locZ >> 4;
++            x = MathHelper.floor(entityplayer.locX) >> 4;
++            z = MathHelper.floor(entityplayer.locZ) >> 4;
+         }
+ 
+         public int compare(ChunkCoordIntPair a, ChunkCoordIntPair b) {
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index 490f8c609d00b33dcd0ef7a7d9b70714a707f194..1a47543c612d522c4d9f406abf1ff0ab9e3aea4a 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -769,7 +769,7 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+             // CraftBukkit - notch decrements the counter by 1 in the above method with food,
+             // snowballs and so forth, but he does it in a place that doesn't cause the
+             // inventory update packet to get sent
+-            always = (itemstack.count != itemstackAmount) || itemstack.getItem() == Item.getItemOf(Blocks.WATERLILY);
++            always = (itemstack.count != itemstackAmount) || itemstack.getItem() instanceof ItemBucket || itemstack.getItem() == Item.getItemOf(Blocks.WATERLILY); // PandaSpigot - rejected bucket predictions need an inventory correction too
+             // CraftBukkit end
+         } else if (blockposition.getY() >= this.minecraftServer.getMaxBuildHeight() - 1 && (enumdirection == EnumDirection.UP || blockposition.getY() >= this.minecraftServer.getMaxBuildHeight())) {
+             ChatMessage chatmessage = new ChatMessage("build.tooHigh", new Object[] { Integer.valueOf(this.minecraftServer.getMaxBuildHeight())});
+@@ -2099,7 +2099,7 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+                 if (itemstack1 != null) {
+                     if (itemstack.getItem() == Items.WRITABLE_BOOK && itemstack.getItem() == itemstack1.getItem()) {
+                         if (!validateBook(itemstack)) return; // PandaSpigot
+-                        itemstack1 = new ItemStack(Items.WRITABLE_BOOK); // CraftBukkit
++                        itemstack1 = itemstack1.cloneItemStack(); // PandaSpigot - Preserve server-side metadata when editing
+                         itemstack1.a("pages", (NBTBase) itemstack.getTag().getList("pages", 8));
+                         CraftEventFactory.handleEditBookEvent(player, itemstack1); // CraftBukkit
+                     }
+diff --git a/src/main/java/net/minecraft/server/PlayerList.java b/src/main/java/net/minecraft/server/PlayerList.java
+index 4e6eb9a247d0f719f8d5d5bbbaf70c9b50f1cf6a..17ba4bce0d1bd076ac006eae30b19a9cb47754d7 100644
+--- a/src/main/java/net/minecraft/server/PlayerList.java
++++ b/src/main/java/net/minecraft/server/PlayerList.java
+@@ -175,6 +175,7 @@ public abstract class PlayerList {
+         this.onPlayerJoin(entityplayer, joinMessage);
+         // CraftBukkit end
+         worldserver = server.getWorldServer(entityplayer.dimension);  // CraftBukkit - Update in case join event changed it
++        entityplayer.sendQueuedChunks(); // PandaSpigot - send the spawn terrain before leaving Downloading Terrain
+         playerconnection.a(entityplayer.locX, entityplayer.locY, entityplayer.locZ, entityplayer.yaw, entityplayer.pitch);
+         this.b(entityplayer, worldserver);
+         if (this.server.getResourcePack().length() > 0) {
+@@ -272,7 +273,7 @@ public abstract class PlayerList {
+         }
+ 
+         worldserver1.getPlayerChunkMap().addPlayer(entityplayer);
+-        worldserver1.chunkProviderServer.getChunkAt((int) entityplayer.locX >> 4, (int) entityplayer.locZ >> 4);
++        worldserver1.chunkProviderServer.getChunkAt(MathHelper.floor(entityplayer.locX) >> 4, MathHelper.floor(entityplayer.locZ) >> 4); // PandaSpigot - negative coordinates
+     }
+ 
+     public int d() {
+@@ -901,6 +902,7 @@ public abstract class PlayerList {
+     }
+ 
+     public void tick() {
++        if (com.hpfxd.pandaspigot.config.PandaSpigotConfig.get().performance.disableTabListPingUpdates) return;
+         if (++this.u > 600) {
+             this.sendAll(new PacketPlayOutPlayerInfo(PacketPlayOutPlayerInfo.EnumPlayerInfoAction.UPDATE_LATENCY, this.players));
+             this.u = 0;
+diff --git a/src/main/java/net/minecraft/server/ServerConnection.java b/src/main/java/net/minecraft/server/ServerConnection.java
+index 882bf62cc8a08e51b5d315c608194a68ae025489..2ed9ad818f50295afa771a9877b8ed09d00b1d60 100644
+--- a/src/main/java/net/minecraft/server/ServerConnection.java
++++ b/src/main/java/net/minecraft/server/ServerConnection.java
+@@ -90,7 +90,11 @@ public class ServerConnection {
+             Class oclass;
+             LazyInitVar lazyinitvar;
+ 
+-            if (Epoll.isAvailable() && this.f.ai()) {
++            boolean domainSocket = address instanceof io.netty.channel.unix.DomainSocketAddress;
++            if (domainSocket && !Epoll.isAvailable()) {
++                throw new IOException("Unix domain sockets require the epoll native transport");
++            }
++            if (Epoll.isAvailable() && (this.f.ai() || domainSocket)) {
+                 // PandaSpigot start - Unix domain socket support
+                 if (address instanceof io.netty.channel.unix.DomainSocketAddress) {
+                     oclass = io.netty.channel.epoll.EpollServerDomainSocketChannel.class;
+diff --git a/src/main/java/net/minecraft/server/World.java b/src/main/java/net/minecraft/server/World.java
+index 522c63e7f884a8b2202b111c81df9b54384703d5..b02a0687a604159866bf94c9959e72ca7c25ccb8 100644
+--- a/src/main/java/net/minecraft/server/World.java
++++ b/src/main/java/net/minecraft/server/World.java
+@@ -78,7 +78,7 @@ public abstract class World implements IBlockAccess {
+     protected float q;
+     protected float r;
+     private int J;
+-    public final Random random = new Random();
++    public final Random random;
+     public WorldProvider worldProvider; // CraftBukkit - remove final
+     protected List<IWorldAccess> u = Lists.newArrayList();
+     protected IChunkProvider chunkProvider;
+@@ -193,6 +193,8 @@ public abstract class World implements IBlockAccess {
+         this.spigotConfig = new org.spigotmc.SpigotWorldConfig( worlddata.getName() ); // Spigot
+         this.paperSpigotConfig = new org.github.paperspigot.PaperSpigotWorldConfig( worlddata.getName() ); // PaperSpigot
+         this.pandaSpigotConfig = com.hpfxd.pandaspigot.config.PandaSpigotConfig.getWorldConfig(worlddata.getName()); // PandaSpigot
++        this.random = this.pandaSpigotConfig.performance.useFastRandom
++                ? new com.hpfxd.pandaspigot.XorShiftRandom() : new Random();
+         this.generator = gen;
+         this.world = new CraftWorld((WorldServer) this, gen, env);
+         this.ticksPerAnimalSpawns = this.getServer().getTicksPerAnimalSpawns(); // CraftBukkit
+@@ -1122,6 +1124,10 @@ public abstract class World implements IBlockAccess {
+     public boolean addEntity(Entity entity, SpawnReason spawnReason) { // Changed signature, added SpawnReason
+         org.spigotmc.AsyncCatcher.catchOp( "entity add"); // Spigot
+         if (entity == null) return false;
++        if (this.pandaSpigotConfig.performance.disableVillagers && entity instanceof EntityVillager) {
++            entity.die();
++            return false;
++        }
+         // CraftBukkit end
+         int i = MathHelper.floor(entity.locX / 16.0D);
+         int j = MathHelper.floor(entity.locZ / 16.0D);
+@@ -1642,7 +1648,7 @@ public abstract class World implements IBlockAccess {
+             }
+             // Spigot end
+ 
+-            if (!tileentity.x() && tileentity.t()) {
++            if (!this.pandaSpigotConfig.performance.disableTileEntityTicking && !tileentity.x() && tileentity.t()) {
+                 BlockPosition blockposition = tileentity.getPosition();
+ 
+                 if (this.isLoaded(blockposition) && this.N.a(blockposition)) {
+@@ -1753,6 +1759,11 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     public void entityJoinedWorld(Entity entity, boolean flag) {
++        // Keep explicit relocation (flag=false), dead-entity cleanup and player simulation working.
++        if (flag && !(entity instanceof EntityHuman)
++                && (this.pandaSpigotConfig.performance.disableNonPlayerEntityTicking
++                || (entity instanceof EntityVillager && this.pandaSpigotConfig.performance.disableVillagers)
++                || (entity instanceof EntityFallingBlock && this.pandaSpigotConfig.performance.disableFallingBlockPhysics))) return;
+         int i = MathHelper.floor(entity.locX);
+         int j = MathHelper.floor(entity.locZ);
+         byte b0 = 32;
+@@ -2264,6 +2275,7 @@ public abstract class World implements IBlockAccess {
+     }
+ 
+     protected void p() {
++        if (this.pandaSpigotConfig.performance.disableWeatherTicking) return;
+         if (!this.worldProvider.o()) {
+             if (!this.isClientSide) {
+                 int i = this.worldData.A();
+diff --git a/src/main/java/net/minecraft/server/WorldServer.java b/src/main/java/net/minecraft/server/WorldServer.java
+index fa64dcafc3ccb2d4c2dcfc00a5aea2c3e6cd8719..a5a67711a662dfecb7293da50bac9cb4452c8717 100644
+--- a/src/main/java/net/minecraft/server/WorldServer.java
++++ b/src/main/java/net/minecraft/server/WorldServer.java
+@@ -206,6 +206,12 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+     // CraftBukkit end
+ 
+     public void doTick() {
++        if (this.pandaSpigotConfig.performance.shouldPause(this.players.size())) {
++            this.chunkProvider.unloadChunks();
++            this.manager.flush();
++            this.getWorld().processChunkGC();
++            return;
++        }
+         super.doTick();
+         if (this.getWorldData().isHardcore() && this.getDifficulty() != EnumDifficulty.HARD) {
+             this.getWorldData().setDifficulty(EnumDifficulty.HARD);
+@@ -226,7 +232,7 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+ 
+         // CraftBukkit start - Only call spawner if we have players online and the world allows for mobs or animals
+         long time = this.worldData.getTime();
+-        if (this.getGameRules().getBoolean("doMobSpawning") && this.worldData.getType() != WorldType.DEBUG_ALL_BLOCK_STATES && (this.allowMonsters || this.allowAnimals) && (this instanceof WorldServer && this.players.size() > 0)) {
++        if (!this.pandaSpigotConfig.performance.disableNaturalMobSpawning && this.getGameRules().getBoolean("doMobSpawning") && this.worldData.getType() != WorldType.DEBUG_ALL_BLOCK_STATES && (this.allowMonsters || this.allowAnimals) && (this instanceof WorldServer && this.players.size() > 0)) {
+             timings.mobSpawn.startTiming(); // Spigot
+             this.R.a(this, this.allowMonsters && (this.ticksPerMonsterSpawns != 0 && time % this.ticksPerMonsterSpawns == 0L), this.allowAnimals && (this.ticksPerAnimalSpawns != 0 && time % this.ticksPerAnimalSpawns == 0L), this.worldData.getTime() % 400L == 0L);
+             timings.mobSpawn.stopTiming(); // Spigot
+@@ -520,6 +526,7 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+ 
+     // PandaSpigot start - Alternative Chunk Ticking Selection
+     protected void h() {
++        if (this.pandaSpigotConfig.performance.disableChunkTicking) return;
+         super.h();
+         if (this.pandaSpigotConfig.useSpigotChunkTickingSelection) {
+             tickSpigotChunkTickSelection();
+@@ -604,6 +611,7 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+     }
+ 
+     private void tickThunder(int k, int l) {
++        if (this.pandaSpigotConfig.performance.disableNaturalLightning) return;
+         if (!this.paperSpigotConfig.disableThunder && this.random.nextInt(100000) == 0 && this.S() && this.R()) { // PaperSpigot - Disable thunder
+             this.m = this.m * 3 + 1013904223;
+             int i1 = this.m >> 2;
+@@ -707,6 +715,7 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+     }
+ 
+     public void a(BlockPosition blockposition, Block block, int i, int j) {
++        if (this.pandaSpigotConfig.performance.disableRedstoneTicking && isRedstoneTick(block)) return;
+         NextTickListEntry nextticklistentry = new NextTickListEntry(blockposition, block);
+         byte b0 = 0;
+ 
+@@ -742,6 +751,7 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+     }
+ 
+     public void b(BlockPosition blockposition, Block block, int i, int j) {
++        if (this.pandaSpigotConfig.performance.disableRedstoneTicking && isRedstoneTick(block)) return;
+         NextTickListEntry nextticklistentry = new NextTickListEntry(blockposition, block);
+ 
+         nextticklistentry.a(j);
+@@ -757,6 +767,7 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+     }
+ 
+     public void tickEntities() {
++        if (this.pandaSpigotConfig.performance.shouldPause(this.players.size())) return;
+         if (false && this.players.isEmpty()) { // CraftBukkit - this prevents entity cleanup, other issues on servers with no players
+             if (this.emptyTime++ >= 1200) {
+                 return;
+@@ -773,6 +784,13 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+         this.emptyTime = 0;
+     }
+ 
++    static boolean isRedstoneTick(Block block) {
++        return block instanceof BlockDiodeAbstract || block instanceof BlockRedstoneTorch
++                || block instanceof BlockRedstoneLamp || block instanceof BlockButtonAbstract
++                || block instanceof BlockPressurePlateAbstract || block instanceof BlockTripwire
++                || block instanceof BlockTripwireHook || block instanceof BlockDispenser;
++    }
++
+     public boolean a(boolean flag) {
+         if (this.worldData.getType() == WorldType.DEBUG_ALL_BLOCK_STATES) {
+             return false;
+@@ -840,6 +858,8 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+                 while (iterator.hasNext()) {
+                     nextticklistentry = (NextTickListEntry) iterator.next();
+                     iterator.remove();
++                    if (this.pandaSpigotConfig.performance.disableRedstoneTicking
++                            && isRedstoneTick(nextticklistentry.a())) continue;
+                     byte b0 = 0;
+ 
+                     if (this.areChunksLoadedBetween(nextticklistentry.a.a(-b0, -b0, -b0), nextticklistentry.a.a(b0, b0, b0))) {
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftServer.java b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+index 2eac381a825ed0edabd12816432f6d2d655887ef..f314cb56d3fd6c6a0702a6eb473e52f5fdfd3c68 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -416,6 +416,11 @@ public final class CraftServer implements Server {
+         return serverVersion + " (MC: " + console.getVersion() + ")";
+     }
+ 
++    @Override
++    public double getMspt() {
++        return console.getMspt();
++    }
++
+     @Override
+     public String getBukkitVersion() {
+         return bukkitVersion;
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
+index 8a08babc132e992d3613e1281dac12875380990c..f296c0470b4cff87f89c3a85db8d6b462f2ffb0b 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
+@@ -254,7 +254,11 @@ public class CraftHumanEntity extends CraftLivingEntity implements HumanEntity {
+ 
+     private void openCustomInventory(Inventory inventory, EntityPlayer player, String windowType) {
+         if (player.playerConnection == null) return;
+-        Container container = new CraftContainer(inventory, this, player.nextContainerCounter());
++        int windowId = player.nextContainerCounter();
++        Container container = inventory.getType() == InventoryType.ANVIL
++                ? new ContainerAnvil(player.inventory, player.world, new BlockPosition(player), player, inventory)
++                : new CraftContainer(inventory, this, windowId);
++        container.windowId = windowId;
+ 
+         container = CraftEventFactory.callInventoryOpenEvent(player, container);
+         if(container == null) return;
+@@ -328,7 +332,11 @@ public class CraftHumanEntity extends CraftLivingEntity implements HumanEntity {
+         if (inventory instanceof CraftInventoryView) {
+             container = ((CraftInventoryView) inventory).getHandle();
+         } else {
+-            container = new CraftContainer(inventory, player.nextContainerCounter());
++            int windowId = player.nextContainerCounter();
++            container = inventory.getType() == InventoryType.ANVIL
++                    ? new ContainerAnvil(player.inventory, player.world, new BlockPosition(player), player, inventory.getTopInventory())
++                    : new CraftContainer(inventory, windowId);
++            container.windowId = windowId;
+         }
+ 
+         // Trigger an INVENTORY_OPEN event
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+index 20631d2a3e74053b8250efe58277c3e3182e2858..34246c65ebfcbd1eab3ce8bd1cbb7a645704cc2e 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+@@ -302,9 +302,9 @@ public class CraftPlayer extends CraftHumanEntity implements Player {
+         } else if (part.equals(net.kyori.adventure.title.TitlePart.TIMES)) {
+             net.kyori.adventure.title.Title.Times times = (net.kyori.adventure.title.Title.Times) value;
+             getHandle().playerConnection.sendPacket(new PacketPlayOutTitle(
+-                (int) (times.fadeIn().toMillis() / 50),
+-                (int) (times.stay().toMillis() / 50),
+-                (int) (times.fadeOut().toMillis() / 50)
++                PacketPlayOutTitle.durationToTicks(times.fadeIn()),
++                PacketPlayOutTitle.durationToTicks(times.stay()),
++                PacketPlayOutTitle.durationToTicks(times.fadeOut())
+             ));
+         }
+     }
+@@ -536,6 +536,12 @@ public class CraftPlayer extends CraftHumanEntity implements Player {
+     public void sendBlockChange(Location loc, int material, byte data) {
+         if (getHandle().playerConnection == null) return;
+ 
++        // PandaSpigot start - a block update must not create a client chunk outside its subscription
++        if (!getWorld().equals(loc.getWorld()) || !getHandle().u().getPlayerChunkMap().a(getHandle(), loc.getBlockX() >> 4, loc.getBlockZ() >> 4)) {
++            return;
++        }
++        // PandaSpigot end
++
+         PacketPlayOutBlockChange packet = new PacketPlayOutBlockChange(((CraftWorld) loc.getWorld()).getHandle(), new BlockPosition(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ()));
+ 
+         packet.block = CraftMagicNumbers.getBlock(material).fromLegacyData(data);
+@@ -1754,7 +1760,7 @@ public class CraftPlayer extends CraftHumanEntity implements Player {
+         // PaperSpigot start - Player view distance API
+         @Override
+         public int getViewDistance() {
+-            return getHandle().viewDistance;
++            return getHandle().getViewDistance(); // PandaSpigot - resolve the current world's default
+         }
+ 
+         @Override
+@@ -1775,4 +1781,26 @@ public class CraftPlayer extends CraftHumanEntity implements Player {
+         return spigot;
+     }
+     // Spigot end
++
++    @Override
++    public String getKnockbackProfile() {
++        return getHandle().world.pandaSpigotConfig.getKnockbackProfileName(getHandle().knockbackProfile);
++    }
++
++    @Override
++    public void setKnockbackProfile(String profile) {
++        if (profile != null && !"default".equals(profile)
++                && !getHandle().world.pandaSpigotConfig.knockbackProfiles.containsKey(profile)) {
++            throw new IllegalArgumentException("Unknown knockback profile: " + profile);
++        }
++        getHandle().knockbackProfile = profile;
++    }
++
++    @Override
++    public java.util.Set<String> getAvailableKnockbackProfiles() {
++        java.util.Set<String> profiles = new java.util.LinkedHashSet<>();
++        profiles.add("default");
++        profiles.addAll(getHandle().world.pandaSpigotConfig.knockbackProfiles.keySet());
++        return java.util.Collections.unmodifiableSet(profiles);
++    }
+ }
+diff --git a/src/main/java/org/spigotmc/RestartCommand.java b/src/main/java/org/spigotmc/RestartCommand.java
+index a398c1bf0a3ceb639086cf9dd39f1103256ca311..371ead80906db22cd268c69cf885bd6b9d69aa37 100644
+--- a/src/main/java/org/spigotmc/RestartCommand.java
++++ b/src/main/java/org/spigotmc/RestartCommand.java
+@@ -83,9 +83,9 @@ public class RestartCommand extends Command
+             {
+             }
+             server.safeShutdown(isRestarting);
+-            closeSocket();
+ 
+-            // Actually shutdown
++            // stop() disables plugins before closing listener channels, allowing network
++            // plugins to remove their handlers while those channels are still available.
+             try
+             {
+                 server.stop();
+diff --git a/src/test/java/com/hpfxd/pandaspigot/TickTimeSamplerTest.java b/src/test/java/com/hpfxd/pandaspigot/TickTimeSamplerTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..78f3e967b05fa1dbddbb4adc62adba1f63d5a497
+--- /dev/null
++++ b/src/test/java/com/hpfxd/pandaspigot/TickTimeSamplerTest.java
+@@ -0,0 +1,23 @@
++package com.hpfxd.pandaspigot;
++
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class TickTimeSamplerTest {
++    @Test
++    public void countsOnlyCompletedSamplesAndEvictsOldestAfterOneHundredTicks() {
++        TickTimeSampler sampler = new TickTimeSampler();
++        assertEquals(0, sampler.getMspt(), 0);
++        sampler.record(10_000_000);
++        assertEquals(10, sampler.getMspt(), 0);
++        sampler.record(30_000_000);
++        assertEquals(20, sampler.getMspt(), 0);
++        for (int i = 0; i < 100; i++) sampler.record(2_000_000);
++        assertEquals(2, sampler.getMspt(), 0);
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void rejectsNegativeDurations() {
++        new TickTimeSampler().record(-1);
++    }
++}
+diff --git a/src/test/java/com/hpfxd/pandaspigot/XorShiftRandomTest.java b/src/test/java/com/hpfxd/pandaspigot/XorShiftRandomTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..101b3fee9fe5278054c51b096efe52a893128c12
+--- /dev/null
++++ b/src/test/java/com/hpfxd/pandaspigot/XorShiftRandomTest.java
+@@ -0,0 +1,46 @@
++package com.hpfxd.pandaspigot;
++
++import java.io.*;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class XorShiftRandomTest {
++    @Test
++    public void zeroSeedDoesNotGetStuckAndReseedingResetsGaussianCache() {
++        XorShiftRandom random = new XorShiftRandom(0);
++        long first = random.nextLong();
++        assertNotEquals(0L, first);
++        assertNotEquals(first, random.nextLong());
++        random.setSeed(42);
++        double gaussian = random.nextGaussian();
++        random.setSeed(42);
++        assertEquals(gaussian, random.nextGaussian(), 0);
++    }
++
++    @Test
++    public void seededSequencesAreReproducibleAndRespectRandomBounds() {
++        XorShiftRandom first = new XorShiftRandom(123);
++        XorShiftRandom second = new XorShiftRandom(123);
++        for (int i = 0; i < 10000; i++) {
++            int value = first.nextInt(37);
++            assertTrue(value >= 0 && value < 37);
++            assertEquals(value, second.nextInt(37));
++            double d = first.nextDouble();
++            assertTrue(d >= 0 && d < 1);
++            assertEquals(d, second.nextDouble(), 0);
++        }
++    }
++
++    @Test
++    public void serializationPreservesSequence() throws Exception {
++        XorShiftRandom random = new XorShiftRandom(9);
++        random.nextLong();
++        ByteArrayOutputStream data = new ByteArrayOutputStream();
++        try (ObjectOutputStream out = new ObjectOutputStream(data)) { out.writeObject(random); }
++        XorShiftRandom restored;
++        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(data.toByteArray()))) {
++            restored = (XorShiftRandom) in.readObject();
++        }
++        assertEquals(random.nextLong(), restored.nextLong());
++    }
++}
+diff --git a/src/test/java/com/hpfxd/pandaspigot/config/ServerPerformanceConfigTest.java b/src/test/java/com/hpfxd/pandaspigot/config/ServerPerformanceConfigTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..798592e414f6e29851a093f87160d0e6b7183481
+--- /dev/null
++++ b/src/test/java/com/hpfxd/pandaspigot/config/ServerPerformanceConfigTest.java
+@@ -0,0 +1,40 @@
++package com.hpfxd.pandaspigot.config;
++
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class ServerPerformanceConfigTest {
++    @Test
++    public void defaultIdleAndActiveRateStayAtTwenty() {
++        ServerPerformanceConfig config = new ServerPerformanceConfig();
++        config.validate();
++        assertEquals(50_000_000L, config.tickIntervalNanos(0));
++        assertEquals(50_000_000L, config.tickIntervalNanos(1));
++    }
++
++    @Test
++    public void hibernationSwitchesBackAsSoonAsAPlayerIsPresent() {
++        ServerPerformanceConfig config = new ServerPerformanceConfig();
++        config.tickRate = 10;
++        config.hibernateWhenEmpty = true;
++        config.validate();
++        assertEquals(1_000_000_000L, config.tickIntervalNanos(0));
++        assertEquals(100_000_000L, config.tickIntervalNanos(1));
++        assertEquals(1_000_000_000L, config.tickIntervalNanos(0));
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void rejectsZeroTickRate() {
++        ServerPerformanceConfig config = new ServerPerformanceConfig();
++        config.tickRate = 0;
++        config.validate();
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void rejectsIdleRateFasterThanNormalRate() {
++        ServerPerformanceConfig config = new ServerPerformanceConfig();
++        config.tickRate = 10;
++        config.idleTickRate = 20;
++        config.validate();
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/BucketSynchronizationTest.java b/src/test/java/net/minecraft/server/BucketSynchronizationTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d8945692e51830f58b8861dde6425f02b089f97
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/BucketSynchronizationTest.java
+@@ -0,0 +1,27 @@
++package net.minecraft.server;
++
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++public class BucketSynchronizationTest extends AbstractTestingBase {
++    @Test
++    public void rejectedBucketUseStillCorrectsPredictedBlocks() {
++        final MovingObjectPosition hit = new MovingObjectPosition(new Vec3D(1, 64, 1), EnumDirection.UP, new BlockPosition(1, 64, 1));
++        ItemBucket bucket = new ItemBucket(Blocks.FLOWING_WATER) {
++            protected MovingObjectPosition a(World world, EntityHuman player, boolean liquids) { return hit; }
++        };
++        World world = mock(World.class);
++        when(world.getType(any(BlockPosition.class))).thenReturn(Blocks.STONE.getBlockData());
++        EntityPlayer player = mock(EntityPlayer.class);
++        player.playerConnection = mock(PlayerConnection.class);
++        ItemStack held = new ItemStack(Items.WATER_BUCKET);
++
++        assertSame(held, bucket.a(held, world, player)); // world.a denies the operation
++        verify(player.playerConnection, times(2)).sendPacket(any(PacketPlayOutBlockChange.class));
++        verify(world).getType(hit.a());
++        verify(world).getType(hit.a().up());
++        verify(world, never()).setTypeAndData(any(BlockPosition.class), any(IBlockData.class), anyInt());
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/CustomAnvilTest.java b/src/test/java/net/minecraft/server/CustomAnvilTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..0267811b0253091a6c64764f75972708a6ab5929
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/CustomAnvilTest.java
+@@ -0,0 +1,70 @@
++package net.minecraft.server;
++
++import org.bukkit.Material;
++import org.bukkit.craftbukkit.entity.CraftHumanEntity;
++import org.bukkit.craftbukkit.inventory.CraftInventoryCustom;
++import org.bukkit.event.inventory.InventoryType;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++public class CustomAnvilTest extends AbstractTestingBase {
++    @Test
++    public void renamingUpdatesTheSuppliedInventoryAndResultCanBeTaken() {
++        EntityHuman player = player();
++        World world = mock(World.class);
++        CraftInventoryCustom inventory = new CraftInventoryCustom(null, InventoryType.ANVIL, "Rename");
++        ContainerAnvil container = new ContainerAnvil(player.inventory, world, BlockPosition.ZERO, player, inventory);
++        container.getSlot(0).set(new ItemStack(Items.DIAMOND_SWORD));
++        container.a("Named sword");
++
++        assertSame(inventory, container.getBukkitView().getTopInventory());
++        assertEquals("Named sword", inventory.getItem(2).getItemMeta().getDisplayName());
++        assertTrue(container.getSlot(2).isAllowed(player));
++        container.clickItem(2, 0, 0, player);
++
++        assertEquals("Named sword", player.inventory.getCarried().getName());
++        assertNull(inventory.getItem(0));
++        assertNull(inventory.getItem(2));
++        verify(player).levelDown(-1);
++        verifyNoInteractions(world);
++    }
++
++    @Test
++    public void pluginInputChangesAreObservedAndCloseRetainsContents() {
++        EntityHuman player = player();
++        CraftInventoryCustom inventory = new CraftInventoryCustom(null, InventoryType.ANVIL);
++        ContainerAnvil container = new ContainerAnvil(player.inventory, mock(World.class), BlockPosition.ZERO, player, inventory);
++        container.a("Named sword");
++        inventory.setItem(0, new org.bukkit.inventory.ItemStack(Material.DIAMOND_SWORD));
++        container.b();
++        assertEquals("Named sword", inventory.getItem(2).getItemMeta().getDisplayName());
++        container.b(player);
++        assertNotNull(inventory.getItem(0));
++    }
++
++    @Test
++    public void resultCannotBeTakenWithoutRequiredExperience() {
++        EntityHuman player = player();
++        player.expLevel = 0;
++        CraftInventoryCustom inventory = new CraftInventoryCustom(null, InventoryType.ANVIL);
++        ContainerAnvil container = new ContainerAnvil(player.inventory, mock(World.class), BlockPosition.ZERO, player, inventory);
++        container.getSlot(0).set(new ItemStack(Items.DIAMOND_SWORD));
++        container.a("Named sword");
++        assertFalse(container.getSlot(2).isAllowed(player));
++        container.clickItem(2, 0, 0, player);
++        assertNull(player.inventory.getCarried());
++        assertNotNull(inventory.getItem(2));
++    }
++
++    private static EntityHuman player() {
++        EntityHuman player = mock(EntityHuman.class);
++        player.inventory = new PlayerInventory(player);
++        player.abilities = new PlayerAbilities();
++        player.expLevel = 30;
++        CraftHumanEntity bukkitPlayer = mock(CraftHumanEntity.class);
++        when(player.getBukkitEntity()).thenReturn(bukkitPlayer);
++        return player;
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/EnchantSynchronizationTest.java b/src/test/java/net/minecraft/server/EnchantSynchronizationTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a1e925b4f2bfabdbfa6587c0622e43d3fa44209
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/EnchantSynchronizationTest.java
+@@ -0,0 +1,56 @@
++package net.minecraft.server;
++
++import org.bukkit.block.Block;
++import org.bukkit.craftbukkit.CraftServer;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.bukkit.plugin.PluginManager;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.junit.Assert.*;
++import static org.mockito.ArgumentMatchers.*;
++import static org.mockito.Mockito.*;
++
++public class EnchantSynchronizationTest extends AbstractTestingBase {
++    @Test
++    public void enchantmentIsSentBeforeTheNextInventoryTick() throws Exception {
++        EntityPlayer player = mock(EntityPlayer.class);
++        player.inventory = new PlayerInventory(player);
++        player.abilities = new PlayerAbilities();
++        player.expLevel = 30;
++        CraftPlayer bukkitPlayer = mock(CraftPlayer.class);
++        when(player.getBukkitEntity()).thenReturn(bukkitPlayer);
++        when(player.cj()).thenReturn(123);
++        World world = mock(World.class);
++        CraftWorld craftWorld = mock(CraftWorld.class);
++        // CraftServer is final and its constructor starts a live server. Allocate only
++        // the event-dispatch fixture used here, without changing the production class.
++        Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
++        java.lang.reflect.Field unsafeField = unsafeClass.getDeclaredField("theUnsafe");
++        unsafeField.setAccessible(true);
++        CraftServer server = (CraftServer) unsafeClass.getMethod("allocateInstance", Class.class)
++                .invoke(unsafeField.get(null), CraftServer.class);
++        java.lang.reflect.Field managerField = CraftServer.class.getDeclaredField("pluginManager");
++        managerField.setAccessible(true);
++        managerField.set(server, new org.bukkit.plugin.SimplePluginManager(null, null));
++        when(world.getWorld()).thenReturn(craftWorld);
++        Block block = mock(Block.class);
++        when(craftWorld.getBlockAt(anyInt(), anyInt(), anyInt())).thenReturn(block);
++        when(world.getServer()).thenReturn(server);
++        ContainerEnchantTable container = new ContainerEnchantTable(player.inventory, world, BlockPosition.ZERO);
++        container.enchantSlots.setItem(0, new ItemStack(Items.DIAMOND_SWORD));
++        container.enchantSlots.setItem(1, new ItemStack(Items.DYE, 3, 4));
++        ICrafting listener = mock(ICrafting.class);
++        container.addSlotListener(listener);
++        // Move beyond the first periodic NBT comparison and clear initial slot notifications.
++        container.b();
++        clearInvocations(listener);
++
++        assertTrue(container.a(player, 0));
++
++        org.mockito.ArgumentCaptor<ItemStack> sent = org.mockito.ArgumentCaptor.forClass(ItemStack.class);
++        verify(listener, atLeastOnce()).a(eq(container), eq(0), sent.capture());
++        assertTrue(sent.getValue().hasEnchantments());
++        assertEquals(2, container.enchantSlots.getItem(1).count);
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/EntityChunkMembershipTest.java b/src/test/java/net/minecraft/server/EntityChunkMembershipTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5cf2257025f594862fce802b9a0b0c373f49c707
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/EntityChunkMembershipTest.java
+@@ -0,0 +1,38 @@
++package net.minecraft.server;
++
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class EntityChunkMembershipTest extends AbstractTestingBase {
++    private static class TestEntity extends Entity {
++        TestEntity() { super(null); }
++        protected void h() {}
++        protected void a(NBTTagCompound tag) {}
++        protected void b(NBTTagCompound tag) {}
++    }
++
++    @Test
++    public void matchingZCannotHideMissingRegistrationOrAnXTeleport() {
++        Entity entity = new TestEntity();
++        assertFalse(entity.isAddedToChunk());
++        entity.ad = true;
++        assertTrue(entity.isAddedToChunk());
++        entity.setPosition(16, 0, 0);
++        assertFalse(entity.isAddedToChunk());
++        entity.ae = 1;
++        assertTrue(entity.isAddedToChunk());
++        entity.setPosition(16, 16, 0);
++        assertFalse(entity.isAddedToChunk());
++    }
++
++    @Test
++    public void negativeCoordinatesUseFloorForEveryAxis() {
++        Entity entity = new TestEntity();
++        entity.ad = true;
++        entity.setPosition(-0.1D, -0.1D, -0.1D);
++        assertFalse(entity.isAddedToChunk());
++        entity.ae = entity.af = entity.ag = -1;
++        assertTrue(entity.isAddedToChunk());
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/EquipmentAttributeSaveTest.java b/src/test/java/net/minecraft/server/EquipmentAttributeSaveTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4ad85b9d5f31452852f73eb6b05a0d3013c96de
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/EquipmentAttributeSaveTest.java
+@@ -0,0 +1,77 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class EquipmentAttributeSaveTest extends AbstractTestingBase {
++    @Test
++    public void removingWeaponBeforeSaveDoesNotPersistItsDamage() throws Exception {
++        TestEntity entity = new TestEntity();
++        applyEquipment(entity, new ItemStack(Items.DIAMOND_SWORD));
++        entity.setEquipment(0, null); // Death/quit clears inventory before the equipment tick.
++        double damageBeforeSave = entity.getAttributeInstance(GenericAttributes.ATTACK_DAMAGE).getValue();
++
++        NBTTagCompound saved = new NBTTagCompound();
++        entity.b(saved);
++
++        TestEntity loaded = new TestEntity();
++        GenericAttributes.a(loaded.getAttributeMap(), saved.getList("Attributes", 10));
++        assertEquals(1.0D, loaded.getAttributeInstance(GenericAttributes.ATTACK_DAMAGE).getValue(), 0.0D);
++        assertEquals(damageBeforeSave, entity.getAttributeInstance(GenericAttributes.ATTACK_DAMAGE).getValue(), 0.0D);
++    }
++
++    @Test
++    public void newlyEquippedWeaponIsNotAppliedBySaving() {
++        TestEntity entity = new TestEntity();
++        entity.setEquipment(0, new ItemStack(Items.DIAMOND_SWORD));
++        entity.b(new NBTTagCompound());
++        assertEquals(1.0D, entity.getAttributeInstance(GenericAttributes.ATTACK_DAMAGE).getValue(), 0.0D);
++    }
++
++    @Test
++    public void serializationFailureRestoresAppliedModifiers() throws Exception {
++        TestEntity entity = new TestEntity();
++        applyEquipment(entity, new ItemStack(Items.DIAMOND_SWORD));
++        double damage = entity.getAttributeInstance(GenericAttributes.ATTACK_DAMAGE).getValue();
++        try {
++            entity.b(new NBTTagCompound() {
++                @Override
++                public void set(String name, NBTBase value) {
++                    if ("Attributes".equals(name)) throw new IllegalStateException("save failed");
++                    super.set(name, value);
++                }
++            });
++            fail("Expected save failure");
++        } catch (IllegalStateException expected) {
++            assertEquals("save failed", expected.getMessage());
++        }
++        assertEquals(damage, entity.getAttributeInstance(GenericAttributes.ATTACK_DAMAGE).getValue(), 0.0D);
++    }
++
++    private static void applyEquipment(TestEntity entity, ItemStack stack) throws Exception {
++        entity.setEquipment(0, stack);
++        entity.getAttributeMap().b(stack.B());
++        Field equipmentCache = EntityLiving.class.getDeclaredField("h");
++        equipmentCache.setAccessible(true);
++        ((ItemStack[]) equipmentCache.get(entity))[0] = stack.cloneItemStack();
++    }
++
++    private static class TestEntity extends EntityLiving {
++        private final ItemStack[] equipment = new ItemStack[5];
++
++        TestEntity() { super(null); }
++
++        @Override
++        protected void initAttributes() {
++            super.initAttributes();
++            getAttributeMap().b(GenericAttributes.ATTACK_DAMAGE).setValue(1.0D);
++        }
++
++        @Override public ItemStack bA() { return equipment[0]; }
++        @Override public ItemStack getEquipment(int slot) { return equipment[slot]; }
++        @Override public void setEquipment(int slot, ItemStack stack) { equipment[slot] = stack; }
++        @Override public ItemStack[] getEquipment() { return equipment; }
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/FencePathfindingTest.java b/src/test/java/net/minecraft/server/FencePathfindingTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..52fc63d00a1c360cf08c2d3ad445f51773d22170
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/FencePathfindingTest.java
+@@ -0,0 +1,49 @@
++package net.minecraft.server;
++
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class FencePathfindingTest extends AbstractTestingBase {
++    private static final class TestEntity extends Entity {
++        TestEntity(float width) { super(null); setSize(width, 1.3F); setPosition(1.2D, 64.0D, 1.2D); }
++        protected void h() {}
++        protected void a(NBTTagCompound tag) {}
++        protected void b(NBTTagCompound tag) {}
++    }
++
++    private PathPoint start(float width, final boolean blockedCenter) {
++        Entity entity = new TestEntity(width);
++        PathfinderNormal pathfinder = new PathfinderNormal();
++        pathfinder.a(new IBlockAccess() {
++            public TileEntity getTileEntity(BlockPosition position) { return null; }
++            public IBlockData getType(BlockPosition position) {
++                return (position.getX() == 0 || position.getZ() == 0 || blockedCenter ? Blocks.FENCE : Blocks.AIR).getBlockData();
++            }
++            public boolean isEmpty(BlockPosition position) { return getType(position).getBlock() == Blocks.AIR; }
++            public int getBlockPower(BlockPosition position, EnumDirection direction) { return 0; }
++        }, entity);
++        return pathfinder.a(entity);
++    }
++
++    @Test
++    public void narrowMobCanStartFromClearCellInsideFence() {
++        PathPoint point = start(0.9F, false);
++        assertEquals(1, point.a);
++        assertEquals(1, point.c);
++    }
++
++    @Test
++    public void blockedCenterDoesNotBecomeAValidStart() {
++        PathPoint point = start(0.9F, true);
++        assertEquals(0, point.a);
++        assertEquals(0, point.c);
++    }
++
++    @Test
++    public void wideMobRetainsBoundingBoxOrigin() {
++        PathPoint point = start(1.4F, false);
++        assertEquals(0, point.a);
++        assertEquals(0, point.c);
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/FishingRodConfigurationTest.java b/src/test/java/net/minecraft/server/FishingRodConfigurationTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1389f622f480b9ccf6f5bc2a85e0d7752704506
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/FishingRodConfigurationTest.java
+@@ -0,0 +1,32 @@
++package net.minecraft.server;
++
++import com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig;
++import java.lang.reflect.Field;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++public class FishingRodConfigurationTest extends AbstractTestingBase {
++    @Test
++    public void disabledRandomnessAndConfiguredLaunchSpeedProduceRepeatableCasts() throws Exception {
++        World world = mock(World.class);
++        world.worldProvider = mock(WorldProvider.class);
++        Field spigotConfig = World.class.getDeclaredField("spigotConfig");
++        spigotConfig.setAccessible(true);
++        spigotConfig.set(world, mock(org.spigotmc.SpigotWorldConfig.class));
++        world.pandaSpigotConfig = new PandaSpigotWorldConfig();
++        world.pandaSpigotConfig.fishingRod.randomTrajectory = false;
++        world.pandaSpigotConfig.fishingRod.launchSpeed = 2.0F;
++        world.pandaSpigotConfig.fishingRod.horizontalMultiplier = 1.5D;
++        EntityHuman owner = mock(EntityHuman.class);
++        EntityFishingHook first = new EntityFishingHook(world, owner);
++        EntityFishingHook second = new EntityFishingHook(world, owner);
++        assertEquals(0.0D, first.motX, 0.0D);
++        assertEquals(0.0D, first.motY, 0.0D);
++        assertEquals(3.0D, first.motZ, 0.0000001D);
++        assertEquals(first.motX, second.motX, 0.0D);
++        assertEquals(first.motY, second.motY, 0.0D);
++        assertEquals(first.motZ, second.motZ, 0.0D);
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/KnockbackProfileTest.java b/src/test/java/net/minecraft/server/KnockbackProfileTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5641ec190d2aa1d04ae3776e516f101ad2c9ee8a
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/KnockbackProfileTest.java
+@@ -0,0 +1,104 @@
++package net.minecraft.server;
++
++import com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig;
++import com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig.KnockbackConfig;
++import java.util.Random;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++public class KnockbackProfileTest extends AbstractTestingBase {
++    @Test
++    public void legacyDefaultsProduceTheSameVelocityAndDisabledPreservesMotion() {
++        EntityLiving victim = victim(new PandaSpigotWorldConfig());
++        victim.motX = 0.2D;
++        victim.motZ = 0.4D;
++        victim.a(null, 1, 1, 0);
++        assertEquals(-0.3D, victim.motX, 0.0000001D);
++        assertEquals(0.4D, victim.motY, 0.0D);
++        assertEquals(0.2D, victim.motZ, 0.0D);
++        victim.world.pandaSpigotConfig.knockback.enabled = false;
++        victim.a(null, 1, 1, 0);
++        assertEquals(-0.3D, victim.motX, 0.0000001D);
++        assertEquals(0.4D, victim.motY, 0.0D);
++    }
++
++    @Test
++    public void namedProfileAndSeparateFrictionApplyToTheVictim() {
++        PandaSpigotWorldConfig worldConfig = new PandaSpigotWorldConfig();
++        KnockbackConfig profile = new KnockbackConfig();
++        profile.frictionHorizontal = 4.0D;
++        profile.frictionVertical = 1.0D;
++        profile.horizontal = 0.2D;
++        profile.vertical = 0.1D;
++        worldConfig.knockbackProfiles.put("practice", profile);
++        EntityLiving victim = victim(worldConfig);
++        victim.knockbackProfile = "practice";
++        victim.motX = 0.4D;
++        victim.motY = 0.1D;
++        victim.a(null, 1, 1, 0);
++        assertEquals(-0.1D, victim.motX, 0.0000001D);
++        assertEquals(0.2D, victim.motY, 0.0000001D);
++    }
++
++    @Test
++    public void profileApiFollowsWorldDefaultsAndValidatesNames() {
++        EntityPlayer handle = mock(EntityPlayer.class);
++        handle.world = mock(World.class);
++        handle.world.pandaSpigotConfig = new PandaSpigotWorldConfig();
++        handle.world.pandaSpigotConfig.knockbackProfiles.put("practice", new KnockbackConfig());
++        handle.world.pandaSpigotConfig.defaultKnockbackProfile = "practice";
++        CraftPlayer player = mock(CraftPlayer.class);
++        when(player.getHandle()).thenReturn(handle);
++        when(player.getKnockbackProfile()).thenCallRealMethod();
++        when(player.getAvailableKnockbackProfiles()).thenCallRealMethod();
++        doCallRealMethod().when(player).setKnockbackProfile(anyString());
++        doCallRealMethod().when(player).setKnockbackProfile(isNull());
++
++        assertEquals("practice", player.getKnockbackProfile());
++        player.setKnockbackProfile("default");
++        assertEquals("default", player.getKnockbackProfile());
++        player.setKnockbackProfile(null);
++        assertEquals("practice", player.getKnockbackProfile());
++        player.setKnockbackProfile("practice");
++        handle.world.pandaSpigotConfig = new PandaSpigotWorldConfig(); // A different world without that profile.
++        assertEquals("default", player.getKnockbackProfile());
++        assertTrue(player.getAvailableKnockbackProfiles().contains("default"));
++        try {
++            player.setKnockbackProfile("missing");
++            fail("Missing profiles must be rejected");
++        } catch (IllegalArgumentException expected) { }
++    }
++
++    @Test
++    public void configuredRangesStayWithinBoundsAndRejectZeroFriction() {
++        KnockbackConfig profile = new KnockbackConfig();
++        profile.horizontalMin = 0.1D;
++        profile.horizontalMax = 0.3D;
++        profile.validate();
++        Random random = new Random(1);
++        for (int i = 0; i < 50; i++) {
++            double value = profile.horizontal(random);
++            assertTrue(value >= 0.1D && value <= 0.3D);
++        }
++        profile.frictionVertical = 0.0D;
++        try {
++            profile.validate();
++            fail("Zero friction would corrupt velocity");
++        } catch (IllegalArgumentException expected) { }
++    }
++
++    private static EntityLiving victim(PandaSpigotWorldConfig config) {
++        EntityLiving victim = mock(EntityLiving.class);
++        victim.world = mock(World.class);
++        victim.world.pandaSpigotConfig = config;
++        victim.random = new Random(1);
++        AttributeInstance resistance = mock(AttributeInstance.class);
++        when(victim.getAttributeInstance(GenericAttributes.c)).thenReturn(resistance);
++        when(victim.getKnockbackConfig()).thenCallRealMethod();
++        doCallRealMethod().when(victim).a(any(), anyFloat(), anyDouble(), anyDouble());
++        return victim;
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/PearlWorldBorderTest.java b/src/test/java/net/minecraft/server/PearlWorldBorderTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a55310fab714db8da1ef61925a2fff6e2fb27418
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/PearlWorldBorderTest.java
+@@ -0,0 +1,56 @@
++package net.minecraft.server;
++
++import java.util.Random;
++import org.bukkit.Location;
++import org.bukkit.craftbukkit.entity.CraftEntity;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.mockito.Mockito.*;
++
++public class PearlWorldBorderTest extends AbstractTestingBase {
++    private EntityPlayer impact(double x) {
++        WorldServer world = mock(WorldServer.class);
++        WorldBorder border = new WorldBorder();
++        border.setSize(10.0D);
++        when(world.getWorldBorder()).thenReturn(border);
++        EntityPlayer player = mock(EntityPlayer.class);
++        player.world = world;
++        player.playerConnection = mock(PlayerConnection.class);
++        NetworkManager network = mock(NetworkManager.class);
++        when(network.g()).thenReturn(true);
++        when(player.playerConnection.a()).thenReturn(network);
++        CraftPlayer bukkitPlayer = mock(CraftPlayer.class);
++        when(player.getBukkitEntity()).thenReturn(bukkitPlayer);
++        when(bukkitPlayer.getLocation()).thenReturn(new Location(null, 0, 64, 0));
++
++        EntityEnderPearl pearl = mock(EntityEnderPearl.class);
++        pearl.world = world;
++        pearl.random = new Random(0) {
++            @Override public float nextFloat() { return 1.0F; }
++        };
++        when(pearl.getShooter()).thenReturn(player);
++        CraftEntity bukkitPearl = mock(CraftEntity.class);
++        when(pearl.getBukkitEntity()).thenReturn(bukkitPearl);
++        when(bukkitPearl.getLocation()).thenReturn(new Location(null, x, 64, 0));
++        MovingObjectPosition hit = new MovingObjectPosition(new Vec3D(x, 64, 0), EnumDirection.UP, new BlockPosition(x, 64, 0));
++        doCallRealMethod().when(pearl).a(hit);
++        pearl.a(hit);
++        verify(pearl).die();
++        return player;
++    }
++
++    @Test
++    public void outsideLandingDoesNotTeleportOrDamagePlayer() {
++        EntityPlayer player = impact(5.01D);
++        verify(player.playerConnection, never()).teleport(any(Location.class));
++        verify(player, never()).damageEntity(any(DamageSource.class), anyFloat());
++    }
++
++    @Test
++    public void insideLandingKeepsNormalTeleportAndDamage() {
++        EntityPlayer player = impact(4.99D);
++        verify(player.playerConnection).teleport(any(Location.class));
++        verify(player).damageEntity(DamageSource.FALL, 5.0F);
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/PlayerViewDistanceTest.java b/src/test/java/net/minecraft/server/PlayerViewDistanceTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..79f2c2e3b8d0a3a5351e69ba5dfe8d7e46b3fc3d
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/PlayerViewDistanceTest.java
+@@ -0,0 +1,78 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Constructor;
++import java.lang.reflect.Field;
++import java.util.Comparator;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class PlayerViewDistanceTest extends org.bukkit.support.AbstractTestingBase {
++    private static <T> T allocate(Class<T> type) throws Exception {
++        Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
++        Field field = unsafeClass.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        return type.cast(unsafeClass.getMethod("allocateInstance", Class.class).invoke(field.get(null), type));
++    }
++
++    private static WorldServer world(int distance) throws Exception {
++        WorldServer world = allocate(WorldServer.class);
++        Field manager = WorldServer.class.getDeclaredField("manager");
++        manager.setAccessible(true);
++        manager.set(world, new PlayerChunkMap(world, distance));
++        return world;
++    }
++
++    @Test
++    public void defaultDistanceFollowsWorldTransferAndWorldChanges() throws Exception {
++        EntityPlayer player = allocate(EntityPlayer.class);
++        player.setViewDistance(-1);
++        player.world = world(10);
++        assertEquals(10, player.getViewDistance());
++        player.world = world(5);
++        assertEquals(5, player.getViewDistance());
++        player.u().getPlayerChunkMap().a(7);
++        assertEquals(7, player.getViewDistance());
++    }
++
++    @Test
++    public void explicitOverrideSurvivesWorldChangesAndCanBeReset() throws Exception {
++        EntityPlayer player = allocate(EntityPlayer.class);
++        player.world = world(10);
++        PlayerChunkMap map = player.u().getPlayerChunkMap();
++        // This player is not subscribed yet, as during login or transfer.
++        Field queue = EntityPlayer.class.getDeclaredField("chunkCoordIntPairQueue");
++        queue.setAccessible(true);
++        queue.set(player, new java.util.LinkedList<ChunkCoordIntPair>());
++        map.updateViewDistance(player, 4);
++        map.a(8);
++        assertEquals(4, player.getViewDistance());
++        map.updateViewDistance(player, -1);
++        assertEquals(8, player.getViewDistance());
++        assertEquals(-1, player.viewDistance);
++    }
++
++    @Test
++    public void removalUsesOriginalWorldDistanceAfterWorldReferenceChanges() throws Exception {
++        EntityPlayer player = allocate(EntityPlayer.class);
++        player.setViewDistance(-1);
++        WorldServer source = world(10);
++        player.world = world(3);
++        assertEquals(10, source.getPlayerChunkMap().getViewDistance(player));
++        assertEquals(3, player.getViewDistance());
++        player.setViewDistance(5);
++        assertEquals(5, source.getPlayerChunkMap().getViewDistance(player));
++    }
++
++    @Test
++    @SuppressWarnings("unchecked")
++    public void closestChunkUsesFloorAtNegativeCoordinates() throws Exception {
++        EntityPlayer player = allocate(EntityPlayer.class);
++        player.locX = -0.1D;
++        player.locZ = -16.1D;
++        Class<?> type = Class.forName("net.minecraft.server.PlayerChunkMap$ChunkCoordComparator");
++        Constructor<?> constructor = type.getDeclaredConstructor(EntityPlayer.class);
++        constructor.setAccessible(true);
++        Comparator<ChunkCoordIntPair> comparator = (Comparator<ChunkCoordIntPair>) constructor.newInstance(player);
++        assertTrue(comparator.compare(new ChunkCoordIntPair(-1, -2), new ChunkCoordIntPair(0, -1)) < 0);
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/RedstoneTickControlTest.java b/src/test/java/net/minecraft/server/RedstoneTickControlTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3d067784729041be0351c00ff696b6150f63410
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/RedstoneTickControlTest.java
+@@ -0,0 +1,32 @@
++package net.minecraft.server;
++
++import com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++public class RedstoneTickControlTest extends AbstractTestingBase {
++    @Test
++    public void skipsScheduledRedstoneWithoutSuppressingFluidAndFallingBlockTicks() {
++        assertTrue(WorldServer.isRedstoneTick(Blocks.UNPOWERED_REPEATER));
++        assertTrue(WorldServer.isRedstoneTick(Blocks.POWERED_COMPARATOR));
++        assertTrue(WorldServer.isRedstoneTick(Blocks.REDSTONE_TORCH));
++        assertTrue(WorldServer.isRedstoneTick(Blocks.DISPENSER));
++        assertTrue(WorldServer.isRedstoneTick(Blocks.DROPPER));
++        assertFalse(WorldServer.isRedstoneTick(Blocks.FLOWING_WATER));
++        assertFalse(WorldServer.isRedstoneTick(Blocks.SAND));
++        assertFalse(WorldServer.isRedstoneTick(Blocks.FIRE));
++    }
++
++    @Test
++    public void disabledSchedulingDoesNotLoadChunksOrEnqueueWork() {
++        WorldServer world = mock(WorldServer.class, CALLS_REAL_METHODS);
++        world.pandaSpigotConfig = new PandaSpigotWorldConfig();
++        world.pandaSpigotConfig.performance.disableRedstoneTicking = true;
++        BlockPosition position = new BlockPosition(100000, 64, 100000);
++        world.a(position, Blocks.UNPOWERED_REPEATER, 2, 0);
++        world.b(position, Blocks.REDSTONE_TORCH, 2, 0);
++        verify(world, never()).areChunksLoadedBetween(any(BlockPosition.class), any(BlockPosition.class));
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/SignPacketTest.java b/src/test/java/net/minecraft/server/SignPacketTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..39f6c415311b65f3bc545a3d699908fdd98f2a96
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/SignPacketTest.java
+@@ -0,0 +1,69 @@
++package net.minecraft.server;
++
++import io.netty.buffer.Unpooled;
++import io.netty.handler.codec.DecoderException;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++
++public class SignPacketTest {
++    @Test
++    public void preservesLiteralTextAndSiblings() {
++        assertEquals("hello world", PacketPlayInUpdateSign.readLiteralLine(
++            "{\"text\":\"hello\",\"bold\":true,\"extra\":[\" \",{\"text\":\"world\"}]}"));
++        assertEquals("\uD83D\uDC3C", PacketPlayInUpdateSign.readLiteralLine("\"\\ud83d\\udc3c\""));
++        assertEquals("", PacketPlayInUpdateSign.readLiteralLine("{\"text\":\"\"}"));
++    }
++
++    @Test(expected = DecoderException.class, timeout = 1000)
++    public void rejectsAmplifyingTranslationsBeforeResolvingThem() {
++        String json = "\"x\"";
++        for (int i = 0; i < 7; ++i) {
++            json = "{\"translate\":\"%1$s%1$s%1$s%1$s\",\"with\":[" + json + "]}";
++        }
++        PacketPlayInUpdateSign.readLiteralLine(json);
++    }
++
++    @Test(expected = DecoderException.class)
++    public void rejectsDynamicSiblings() {
++        PacketPlayInUpdateSign.readLiteralLine("{\"text\":\"\",\"extra\":[{\"selector\":\"@a\"}]}");
++    }
++
++    @Test(expected = DecoderException.class)
++    public void rejectsNull() {
++        PacketPlayInUpdateSign.readLiteralLine("null");
++    }
++
++    @Test(expected = DecoderException.class)
++    public void rejectsMalformedText() {
++        PacketPlayInUpdateSign.readLiteralLine("{\"text\":{}}");
++    }
++
++    @Test
++    public void decodesFourVanillaSignLines() throws Exception {
++        PacketDataSerializer buffer = new PacketDataSerializer(Unpooled.buffer());
++        try {
++            buffer.a(new BlockPosition(10, 64, -10));
++            for (int i = 0; i < 4; ++i) buffer.a("{\"text\":\"line " + i + "\"}");
++            PacketPlayInUpdateSign packet = new PacketPlayInUpdateSign();
++            packet.a(buffer);
++            assertEquals(new BlockPosition(10, 64, -10), packet.a());
++            for (int i = 0; i < 4; ++i) assertEquals("line " + i, packet.b()[i].c());
++            assertEquals(0, buffer.readableBytes());
++        } finally {
++            buffer.release();
++        }
++    }
++
++    @Test(expected = DecoderException.class)
++    public void enforcesWireLengthBeforeParsing() throws Exception {
++        PacketDataSerializer buffer = new PacketDataSerializer(Unpooled.buffer());
++        try {
++            buffer.a(new BlockPosition(0, 0, 0));
++            buffer.a(new String(new char[385]).replace('\0', 'x'));
++            new PacketPlayInUpdateSign().a(buffer);
++        } finally {
++            buffer.release();
++        }
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/TitleTimingTest.java b/src/test/java/net/minecraft/server/TitleTimingTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ea5adb410effbe39410217441d3d9c670d3fbdb
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/TitleTimingTest.java
+@@ -0,0 +1,47 @@
++package net.minecraft.server;
++
++import io.netty.buffer.Unpooled;
++import java.time.Duration;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++public class TitleTimingTest {
++    @Test
++    public void retainsNormalAndUnchangedTimes() throws Exception {
++        assertTimes(new PacketPlayOutTitle(10, 70, 20), 10, 70, 20);
++        assertTimes(new PacketPlayOutTitle(-1, 0, -1), -1, 0, -1);
++    }
++
++    @Test
++    public void capsEachPhaseSoPartialUpdatesCannotOverflowClientTotal() throws Exception {
++        int limit = PacketPlayOutTitle.MAX_TITLE_TICKS;
++        assertTrue(3L * limit <= Integer.MAX_VALUE);
++        assertTimes(new PacketPlayOutTitle(Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE), limit, limit, limit);
++        assertTimes(new PacketPlayOutTitle(-1, Integer.MAX_VALUE, -1), -1, limit, -1);
++    }
++
++    @Test
++    public void convertsAdventureDurationsWithoutLongOrIntegerOverflow() {
++        assertEquals(30, PacketPlayOutTitle.durationToTicks(Duration.ofMillis(1500)));
++        assertEquals(0, PacketPlayOutTitle.durationToTicks(Duration.ofNanos(49999999)));
++        assertEquals(1, PacketPlayOutTitle.durationToTicks(Duration.ofMillis(50)));
++        assertEquals(-1, PacketPlayOutTitle.durationToTicks(Duration.ofMillis(-1)));
++        assertEquals(PacketPlayOutTitle.MAX_TITLE_TICKS, PacketPlayOutTitle.durationToTicks(Duration.ofSeconds(Long.MAX_VALUE)));
++    }
++
++    private void assertTimes(PacketPlayOutTitle packet, int fadeIn, int stay, int fadeOut) throws Exception {
++        PacketDataSerializer buffer = new PacketDataSerializer(Unpooled.buffer());
++        try {
++            packet.b(buffer);
++            assertEquals(PacketPlayOutTitle.EnumTitleAction.TIMES, buffer.a(PacketPlayOutTitle.EnumTitleAction.class));
++            assertEquals(fadeIn, buffer.readInt());
++            assertEquals(stay, buffer.readInt());
++            assertEquals(fadeOut, buffer.readInt());
++            assertEquals(0, buffer.readableBytes());
++        } finally {
++            buffer.release();
++        }
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/ToolBreakEffectTest.java b/src/test/java/net/minecraft/server/ToolBreakEffectTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d90c30f0249d8accef2874465c9c7d8936de875
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/ToolBreakEffectTest.java
+@@ -0,0 +1,31 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import java.util.Random;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.mockito.ArgumentMatchers.*;
++import static org.mockito.Mockito.*;
++
++public class ToolBreakEffectTest extends AbstractTestingBase {
++    @Test
++    public void ownerGetsBreakSoundAndServerBroadcastsItemParticles() throws Exception {
++        EntityPlayer player = mock(EntityPlayer.class);
++        WorldServer world = mock(WorldServer.class);
++        Field random = World.class.getDeclaredField("random");
++        random.setAccessible(true);
++        random.set(world, new Random(1));
++        player.world = world;
++        player.random = new Random(2);
++        when(player.getHeadHeight()).thenReturn(1.62F);
++        doCallRealMethod().when(player).b(any(ItemStack.class));
++
++        ItemStack tool = new ItemStack(Items.DIAMOND_PICKAXE);
++        player.b(tool);
++
++        verify(world).makeSound(eq(player), eq("random.break"), eq(0.8F), anyFloat());
++        verify(world, times(5)).sendParticles(eq(player), eq(EnumParticle.ITEM_CRACK), eq(false),
++                anyDouble(), anyDouble(), anyDouble(), eq(0), anyDouble(), anyDouble(), anyDouble(), eq(1.0D),
++                eq(Item.getId(Items.DIAMOND_PICKAXE)), eq(tool.getData()));
++    }
++}
+diff --git a/src/test/java/net/minecraft/server/WritableBookPacketTest.java b/src/test/java/net/minecraft/server/WritableBookPacketTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8812ef1a7a817f121a0dda657066abf8d0a61f43
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/WritableBookPacketTest.java
+@@ -0,0 +1,43 @@
++package net.minecraft.server;
++
++import io.netty.buffer.Unpooled;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class WritableBookPacketTest extends AbstractTestingBase {
++    @Test
++    public void namedBlankBookHasAnEditablePageOnTheWire() throws Exception {
++        ItemStack book = new ItemStack(Items.WRITABLE_BOOK);
++        book.c("Notebook");
++        NBTTagCompound original = (NBTTagCompound) book.getTag().clone();
++
++        ItemStack received = roundTrip(book);
++
++        assertEquals("Notebook", received.getName());
++        assertTrue(ItemBookAndQuill.b(received.getTag()));
++        assertEquals(1, received.getTag().getList("pages", 8).size());
++        assertEquals("", received.getTag().getList("pages", 8).getString(0));
++        assertEquals(original, book.getTag());
++    }
++
++    @Test
++    public void existingPagesArePreserved() throws Exception {
++        ItemStack book = new ItemStack(Items.WRITABLE_BOOK);
++        NBTTagList pages = new NBTTagList();
++        pages.add(new NBTTagString("Already written"));
++        book.a("pages", pages);
++
++        assertEquals("Already written", roundTrip(book).getTag().getList("pages", 8).getString(0));
++    }
++
++    private static ItemStack roundTrip(ItemStack book) throws Exception {
++        PacketDataSerializer buffer = new PacketDataSerializer(Unpooled.buffer());
++        try {
++            buffer.a(book);
++            return buffer.i();
++        } finally {
++            buffer.release();
++        }
++    }
++}
+diff --git a/src/test/java/org/bukkit/support/DummyServer.java b/src/test/java/org/bukkit/support/DummyServer.java
+index e5215bb4e57cd9f572f2ef97663dc8bb4ac6467c..d932d81fb8578b5676b725e92d24de1843abada4 100644
+--- a/src/test/java/org/bukkit/support/DummyServer.java
++++ b/src/test/java/org/bukkit/support/DummyServer.java
+@@ -18,6 +18,15 @@ public class DummyServer implements InvocationHandler {
+     private static final HashMap<Method, MethodHandler> methods = new HashMap<Method, MethodHandler>();
+     static {
+         try {
++            methods.put(
++                    Server.class.getMethod("getPluginManager"),
++                    new MethodHandler() {
++                        final org.bukkit.plugin.PluginManager manager = new org.bukkit.plugin.SimplePluginManager(null, null);
++                        public Object handle(DummyServer server, Object[] args) {
++                            return manager;
++                        }
++                    }
++                );
+             methods.put(
+                     Server.class.getMethod("getItemFactory"),
+                     new MethodHandler() {

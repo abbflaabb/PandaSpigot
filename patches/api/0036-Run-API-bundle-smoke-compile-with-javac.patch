@@ -1,0 +1,63 @@
+From 79430b4f029fa54d1cf97b54e82f4aedf3affe9b Mon Sep 17 00:00:00 2001
+From: Manus <dev-agent@manus.ai>
+Date: Sat, 17 Oct 2026 00:10:52 +0300
+Subject: [PATCH] Run API bundle smoke compile with javac
+
+Co-authored-by: Manus <dev-agent@manus.ai>
+---
+ build.gradle.kts | 31 +++++++++++++++++++++++++------
+ 1 file changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 6b28db91..fd8906e6 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -44,7 +44,7 @@ val apiBundleJar = tasks.register<Jar>("apiBundleJar") {
+     duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
+     from(sourceSets.main.get().output)
+     from({
+-        configurations.compileClasspath.files
++        sourceSets.main.get().compileClasspath.files
+             .filter { it.isFile && it.extension.equals("jar", ignoreCase = true) }
+             .map { zipTree(it) }
+     })
+@@ -64,12 +64,31 @@ tasks {
+         }
+     }
+ 
+-    val compileApiBundleSmokeTest = register<JavaCompile>("compileApiBundleSmokeTest") {
++    val compileApiBundleSmokeTest = register<Exec>("compileApiBundleSmokeTest") {
+         dependsOn(apiBundleJar)
+-        source(files("src/test/api-bundle/ApiBundleCompileSmokeTest.java"))
+-        classpath = files(apiBundleJar.flatMap { it.archiveFile })
+-        destinationDirectory.set(layout.buildDirectory.dir("apiBundleCompileSmokeTest/classes"))
+-        options.release.set(8)
++        val sourceFile = file("src/test/api-bundle/ApiBundleCompileSmokeTest.java")
++        val classesDirectory = layout.buildDirectory.dir("apiBundleCompileSmokeTest/classes").get().asFile
++        val javacName = if (System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) "javac.exe" else "javac"
++        val javac = file("${System.getProperty("java.home")}/bin/$javacName")
++        inputs.file(sourceFile)
++        inputs.file(apiBundleJar.flatMap { it.archiveFile })
++        outputs.dir(classesDirectory)
++        commandLine(
++            javac.absolutePath,
++            "--release", "8",
++            "-classpath", apiBundleJar.get().archiveFile.get().asFile.absolutePath,
++            "-d", classesDirectory.absolutePath,
++            sourceFile.absolutePath
++        )
++        doFirst {
++            classesDirectory.deleteRecursively()
++            classesDirectory.mkdirs()
++        }
++        doLast {
++            check(classesDirectory.resolve("ApiBundleCompileSmokeTest.class").isFile) {
++                "javac did not produce the API bundle smoke-test class"
++            }
++        }
+     }
+ 
+     check {
+-- 
+2.45.1.windows.1
+

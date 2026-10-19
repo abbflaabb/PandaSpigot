@@ -1,0 +1,45 @@
+From b1a9229d22740a904b35b39f8834a8d668380e54 Mon Sep 17 00:00:00 2001
+From: Manus <dev-agent@manus.ai>
+Date: Fri, 16 Oct 2026 22:11:29 +0300
+Subject: [PATCH] Publish a standalone API compile bundle
+
+Co-authored-by: Manus <dev-agent@manus.ai>
+---
+ build.gradle.kts | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 2402e717..ef5c9b51 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -38,6 +38,19 @@ dependencies {
+     testImplementation("net.sf.trove4j:trove4j:3.0.3") // required by tests
+ }
+ 
++val apiBundleJar = tasks.register<Jar>("apiBundleJar") {
++    description = "Builds a self-contained compile-time API jar; the regular API artifact remains thin."
++    archiveClassifier.set("bundle")
++    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
++    from(sourceSets.main.get().output)
++    from({
++        configurations.compileClasspath.files
++            .filter { it.isFile && it.extension.equals("jar", ignoreCase = true) }
++            .map { zipTree(it) }
++    })
++    exclude("META-INF/MANIFEST.MF", "META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/INDEX.LIST")
++}
++
+ tasks {
+     val generateApiVersioningFile = register("generateApiVersioningFile") {
+         val projectVersion = project.version
+@@ -91,6 +104,7 @@ publishing {
+     publications {
+         create<MavenPublication>("mavenJava") {
+             from(components["java"])
++            artifact(apiBundleJar)
+             versionMapping {
+                 usage("java-api") {
+                     fromResolutionOf("runtimeClasspath")
+-- 
+2.45.1.windows.1
+

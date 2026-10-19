@@ -1,0 +1,57 @@
+From f308c2ceceb74f67ca0af66ac9dc321b54473e12 Mon Sep 17 00:00:00 2001
+From: Manus <dev-agent@manus.ai>
+Date: Fri, 16 Oct 2026 22:12:21 +0300
+Subject: [PATCH] Add standalone API compile smoke test
+
+Co-authored-by: Manus <dev-agent@manus.ai>
+---
+ build.gradle.kts                                   | 12 ++++++++++++
+ src/test/api-bundle/ApiBundleCompileSmokeTest.java | 13 +++++++++++++
+ 2 files changed, 25 insertions(+)
+ create mode 100644 src/test/api-bundle/ApiBundleCompileSmokeTest.java
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index ef5c9b51..6b28db91 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -64,6 +64,18 @@ tasks {
+         }
+     }
+ 
++    val compileApiBundleSmokeTest = register<JavaCompile>("compileApiBundleSmokeTest") {
++        dependsOn(apiBundleJar)
++        source(files("src/test/api-bundle/ApiBundleCompileSmokeTest.java"))
++        classpath = files(apiBundleJar.flatMap { it.archiveFile })
++        destinationDirectory.set(layout.buildDirectory.dir("apiBundleCompileSmokeTest/classes"))
++        options.release.set(8)
++    }
++
++    check {
++        dependsOn(compileApiBundleSmokeTest)
++    }
++
+     jar {
+         from(generateApiVersioningFile.map { it.outputs.files.singleFile }) {
+             into("META-INF/maven/${project.group}/${project.name.lowercase()}")
+diff --git a/src/test/api-bundle/ApiBundleCompileSmokeTest.java b/src/test/api-bundle/ApiBundleCompileSmokeTest.java
+new file mode 100644
+index 00000000..c1b19ff7
+--- /dev/null
++++ b/src/test/api-bundle/ApiBundleCompileSmokeTest.java
+@@ -0,0 +1,13 @@
++import net.kyori.adventure.audience.Audience;
++import org.bukkit.command.CommandSender;
++import org.bukkit.entity.Player;
++
++final class ApiBundleCompileSmokeTest {
++    static Audience asAudience(Player player) {
++        return player;
++    }
++
++    static CommandSender asCommandSender(Player player) {
++        return player;
++    }
++}
+-- 
+2.45.1.windows.1
+

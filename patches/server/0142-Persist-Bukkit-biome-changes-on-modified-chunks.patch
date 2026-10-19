@@ -1,0 +1,48 @@
+From c2d2602e6291e9a39967a9dc6154bcaa471e13e8 Mon Sep 17 00:00:00 2001
+From: Manus <dev-agent@manus.ai>
+Date: Fri, 16 Oct 2026 22:09:35 +0300
+Subject: [PATCH] Persist Bukkit biome changes on modified chunks
+
+Co-authored-by: Manus <dev-agent@manus.ai>
+---
+ src/main/java/net/minecraft/server/Chunk.java        | 5 +++++
+ src/main/java/org/bukkit/craftbukkit/CraftWorld.java | 7 ++++++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/main/java/net/minecraft/server/Chunk.java b/src/main/java/net/minecraft/server/Chunk.java
+index bdbda3e61..ce19f2e37 100644
+--- a/src/main/java/net/minecraft/server/Chunk.java
++++ b/src/main/java/net/minecraft/server/Chunk.java
+@@ -1264,6 +1264,11 @@ public class Chunk {
+         return this.e;
+     }
+ 
++    public void markDirty() {
++        this.q = true;
++        this.chunkMap = null;
++    }
++
+     public void a(byte[] abyte) {
+         if (this.e.length != abyte.length) {
+             Chunk.c.warn("Could not set level chunk biomes, array length is " + abyte.length + " instead of " + this.e.length);
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+index da8164a0e..236e79974 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+@@ -656,7 +656,12 @@ public class CraftWorld implements World {
+ 
+             if (chunk != null) {
+                 byte[] biomevals = chunk.getBiomeIndex();
+-                biomevals[((z & 0xF) << 4) | (x & 0xF)] = (byte)bb.id;
++                int index = ((z & 0xF) << 4) | (x & 0xF);
++                byte biomeId = (byte) bb.id;
++                if (biomevals[index] != biomeId) {
++                    biomevals[index] = biomeId;
++                    chunk.markDirty();
++                }
+             }
+         }
+     }
+-- 
+2.45.1.windows.1
+

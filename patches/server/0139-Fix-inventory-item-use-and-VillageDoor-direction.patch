@@ -1,0 +1,77 @@
+From ed604590ef7b24827523996a576aa48937a8b1ee Mon Sep 17 00:00:00 2001
+From: Manus <dev-agent@manus.ai>
+Date: Fri, 16 Oct 2026 21:50:32 +0300
+Subject: [PATCH] Fix inventory item use and VillageDoor direction
+
+Co-authored-by: Manus <dev-agent@manus.ai>
+---
+ .../minecraft/server/PlayerInteractManager.java   |  3 +++
+ .../java/net/minecraft/server/VillageDoor.java    |  2 +-
+ .../craftbukkit/event/CraftEventFactory.java      |  1 +
+ .../net/minecraft/server/VillageDoorTest.java     | 15 +++++++++++++++
+ 4 files changed, 20 insertions(+), 1 deletion(-)
+ create mode 100644 src/test/java/net/minecraft/server/VillageDoorTest.java
+
+diff --git a/src/main/java/net/minecraft/server/PlayerInteractManager.java b/src/main/java/net/minecraft/server/PlayerInteractManager.java
+index 4a6b18390..d00d2e108 100644
+--- a/src/main/java/net/minecraft/server/PlayerInteractManager.java
++++ b/src/main/java/net/minecraft/server/PlayerInteractManager.java
+@@ -371,6 +371,9 @@ public class PlayerInteractManager {
+     }
+ 
+     public boolean useItem(EntityHuman entityhuman, World world, ItemStack itemstack) {
++        if (entityhuman.activeContainer != entityhuman.defaultContainer) { // PandaSpigot - Ignore item use while an inventory is open
++            return false;
++        }
+         if (this.gamemode == WorldSettings.EnumGamemode.SPECTATOR) {
+             return false;
+         } else {
+diff --git a/src/main/java/net/minecraft/server/VillageDoor.java b/src/main/java/net/minecraft/server/VillageDoor.java
+index 74b74ddd4..9ef890bc3 100644
+--- a/src/main/java/net/minecraft/server/VillageDoor.java
++++ b/src/main/java/net/minecraft/server/VillageDoor.java
+@@ -38,7 +38,7 @@ public class VillageDoor {
+ 
+     public boolean c(BlockPosition blockposition) {
+         int i = blockposition.getX() - this.a.getX();
+-        int j = blockposition.getZ() - this.a.getY();
++        int j = blockposition.getZ() - this.a.getZ(); // PandaSpigot - Use Z for the Z-axis distance
+ 
+         return i * this.c.getAdjacentX() + j * this.c.getAdjacentZ() >= 0;
+     }
+diff --git a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+index 1705b5a51..190c91743 100644
+--- a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
++++ b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+@@ -737,6 +737,7 @@ public class CraftEventFactory {
+             return null;
+         }
+ 
++        player.bV(); // PandaSpigot - Clear active item use after a successful inventory open
+         return container;
+     }
+ 
+diff --git a/src/test/java/net/minecraft/server/VillageDoorTest.java b/src/test/java/net/minecraft/server/VillageDoorTest.java
+new file mode 100644
+index 000000000..ba2511ec0
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/VillageDoorTest.java
+@@ -0,0 +1,15 @@
++package net.minecraft.server;
++
++import org.junit.Test;
++
++import static org.junit.Assert.assertTrue;
++
++public class VillageDoorTest {
++
++    @Test
++    public void determinesSideUsingZCoordinate() {
++        VillageDoor door = new VillageDoor(new BlockPosition(0, 100, 0), EnumDirection.SOUTH, 0);
++
++        assertTrue(door.c(new BlockPosition(0, 100, 1)));
++    }
++}
+-- 
+2.45.1.windows.1
+

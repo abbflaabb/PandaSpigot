@@ -1,0 +1,5 @@
+name: ViaAckStartupFixture
+version: '1.0'
+main: integration.StartupFixture
+depend: [ViaVersion]
+loadbefore: [PandaSpigotViaAck]

@@ -1,0 +1,115 @@
+From 1126470d59b5374c2ff9437a000186f7edf4a7b4 Mon Sep 17 00:00:00 2001
+From: Manus <dev-agent@manus.ai>
+Date: Sat, 17 Oct 2026 00:17:41 +0300
+Subject: [PATCH] Configure natural and potion regeneration per world
+
+Co-authored-by: Manus <dev-agent@manus.ai>
+---
+ .../net/minecraft/server/FoodMetaData.java    |  4 +--
+ .../java/net/minecraft/server/MobEffect.java  |  2 +-
+ .../net/minecraft/server/MobEffectList.java   | 11 ++++++-
+ .../java/org/spigotmc/SpigotWorldConfig.java  | 30 +++++++++++++++++++
+ 4 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/src/main/java/net/minecraft/server/FoodMetaData.java b/src/main/java/net/minecraft/server/FoodMetaData.java
+index d0bcad676..93802a906 100644
+--- a/src/main/java/net/minecraft/server/FoodMetaData.java
++++ b/src/main/java/net/minecraft/server/FoodMetaData.java
+@@ -60,9 +60,9 @@ public class FoodMetaData {
+ 
+         if (entityhuman.world.getGameRules().getBoolean("naturalRegeneration") && this.foodLevel >= 18 && entityhuman.cm()) {
+             ++this.foodTickTimer;
+-            if (this.foodTickTimer >= 80) {
++            if (this.foodTickTimer >= entityhuman.world.spigotConfig.regenerationSpeed) {
+                 // CraftBukkit - added RegainReason
+-                entityhuman.heal(1.0F, org.bukkit.event.entity.EntityRegainHealthEvent.RegainReason.SATIATED);
++                entityhuman.heal(entityhuman.world.spigotConfig.healthPerRegen, org.bukkit.event.entity.EntityRegainHealthEvent.RegainReason.SATIATED);
+                 this.a(entityhuman.world.spigotConfig.regenExhaustion); // Spigot - Change to use configurable value
+                 this.foodTickTimer = 0;
+             }
+diff --git a/src/main/java/net/minecraft/server/MobEffect.java b/src/main/java/net/minecraft/server/MobEffect.java
+index c9f433f83..3896fe21a 100644
+--- a/src/main/java/net/minecraft/server/MobEffect.java
++++ b/src/main/java/net/minecraft/server/MobEffect.java
+@@ -80,7 +80,7 @@ public class MobEffect {
+ 
+     public boolean tick(EntityLiving entityliving) {
+         if (this.duration > 0) {
+-            if (MobEffectList.byId[this.effectId].a(this.duration, this.amplification)) {
++            if (MobEffectList.byId[this.effectId].a(entityliving, this.duration, this.amplification)) {
+                 this.b(entityliving);
+             }
+ 
+diff --git a/src/main/java/net/minecraft/server/MobEffectList.java b/src/main/java/net/minecraft/server/MobEffectList.java
+index 863e9d8e9..04b7d05b9 100644
+--- a/src/main/java/net/minecraft/server/MobEffectList.java
++++ b/src/main/java/net/minecraft/server/MobEffectList.java
+@@ -92,7 +92,7 @@ public class MobEffectList {
+     public void tick(EntityLiving entityliving, int i) {
+         if (this.id == MobEffectList.REGENERATION.id) {
+             if (entityliving.getHealth() < entityliving.getMaxHealth()) {
+-                entityliving.heal(1.0F, RegainReason.MAGIC_REGEN); // CraftBukkit
++                entityliving.heal(entityliving.world.spigotConfig.healthPerRegen, RegainReason.MAGIC_REGEN); // CraftBukkit - configurable regeneration health
+             }
+         } else if (this.id == MobEffectList.POISON.id) {
+             if (entityliving.getHealth() > 1.0F) {
+@@ -167,6 +167,15 @@ public class MobEffectList {
+         }
+     }
+ 
++    public boolean a(EntityLiving entityliving, int i, int j) {
++        if (this.id == MobEffectList.REGENERATION.id) {
++            int amplifier = Math.max(0, j);
++            int interval = amplifier >= 31 ? 1 : entityliving.world.spigotConfig.regenerationPotionEffectSpeed >> amplifier;
++            return i % Math.max(1, interval) == 0;
++        }
++        return this.a(i, j);
++    }
++
+     public MobEffectList c(String s) {
+         this.M = s;
+         return this;
+diff --git a/src/main/java/org/spigotmc/SpigotWorldConfig.java b/src/main/java/org/spigotmc/SpigotWorldConfig.java
+index c028e9ff3..b3baa151b 100644
+--- a/src/main/java/org/spigotmc/SpigotWorldConfig.java
++++ b/src/main/java/org/spigotmc/SpigotWorldConfig.java
+@@ -316,6 +316,36 @@ public class SpigotWorldConfig
+         regenExhaustion = (float) getDouble( "hunger.regen-exhaustion", 3 );
+     }
+ 
++    public int regenerationSpeed;
++    public float healthPerRegen;
++    public int regenerationPotionEffectSpeed;
++    private void regenerationSettings()
++    {
++        regenerationSpeed = getPositiveInt( "regeneration.speed", 80 );
++        regenerationPotionEffectSpeed = getPositiveInt( "regeneration.potion-effect-speed", 50 );
++
++        double health = getDouble( "regeneration.health-per-regen", 1.0 );
++        if ( Double.isNaN( health ) || Double.isInfinite( health ) )
++        {
++            health = 1.0;
++        }
++        healthPerRegen = (float) Math.max( 0.0, Math.min( health, 20.0 ) );
++
++        log( "Natural regeneration interval: " + regenerationSpeed + " ticks; health per regeneration: " + healthPerRegen );
++        log( "Regeneration potion interval: " + regenerationPotionEffectSpeed + " ticks" );
++    }
++
++    private int getPositiveInt(String path, int def)
++    {
++        int value = getInt( path, def );
++        if ( value < 1 )
++        {
++            log( "Invalid " + path + " value " + value + "; using " + def );
++            return def;
++        }
++        return value;
++    }
++
+     public int currentPrimedTnt = 0;
+     public int maxTntTicksPerTick;
+     private void maxTntPerTick() {
+-- 
+2.45.1.windows.1
+

@@ -66,7 +66,39 @@ dependencies {
 ```
 </details>
 
+For manual `javac` builds that use a single classpath entry, the API publication
+also provides the `bundle` classifier (`pandaspigot-api-<version>-bundle.jar`),
+which includes the compile-time dependencies such as Adventure. Maven and Gradle
+users should normally keep using the regular thin API artifact so its dependency
+metadata remains in effect.
+
+## World regeneration settings
+Natural and potion regeneration can be tuned per world in `spigot.yml`:
+
+```yaml
+world-settings:
+  default:
+    regeneration:
+      speed: 80
+      health-per-regen: 1.0
+      potion-effect-speed: 50
+```
+
+`speed` and `potion-effect-speed` are tick intervals; the potion interval is
+scaled by effect amplifier as in vanilla. `health-per-regen` is the amount healed
+per regeneration event (clamped to 0–20). These defaults preserve vanilla timing
+and healing, and the `naturalRegeneration` game rule still controls natural
+regeneration. A world-specific value can override the `default` section.
+
 ## Requirements
+The local issue-fix changes and their verification status are documented in
+[tasks/issue-status.md](tasks/issue-status.md). See
+[configuration controls](tasks/configuration.md) for knockback profiles, fishing
+rods, tick-rate/MSPT and per-world simulation settings. Modern client block
+prediction support is available through the optional
+[ViaAck compatibility plugin](compatibility/via-ack/README.md), which requires
+the patched server and Java 17.
+
 To work with PandaSpigot, you will need:
 - JDK 17 or higher
 - Git

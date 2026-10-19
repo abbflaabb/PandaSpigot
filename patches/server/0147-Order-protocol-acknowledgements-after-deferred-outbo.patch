@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Admin <callmeabbascallmeabbas@gmail.com>
+Date: Mon, 19 Oct 2026 09:54:56 +0300
+Subject: [PATCH 147/147] Order protocol acknowledgements after deferred
+ outbound packets
+
+
+diff --git a/src/main/java/net/minecraft/server/NetworkManager.java b/src/main/java/net/minecraft/server/NetworkManager.java
+index 39aa3cc8a8b0e983d1e39828720beb0c0c9eb771..697a442693bcd4a9e0f562acdf956e3ca5e696d2 100644
+--- a/src/main/java/net/minecraft/server/NetworkManager.java
++++ b/src/main/java/net/minecraft/server/NetworkManager.java
+@@ -141,7 +141,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+     public void channelActive(ChannelHandlerContext channelhandlercontext) throws Exception {
+         super.channelActive(channelhandlercontext);
+         this.channel = channelhandlercontext.channel();
+-        this.l = this.channel.remoteAddress();
++        this.l = normalizeRawAddress(this.channel.remoteAddress());
+         // Spigot Start
+         this.preparing = false;
+         // Spigot End
+@@ -385,6 +385,20 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+         return false;
+     }
+ 
++    /**
++     * Queue an event-loop callback after all preceding outbound packets are ready
++     * and dispatched. Call on the server thread. Used by protocol translators so
++     * prediction acknowledgements cannot overtake a deferred chunk/block update.
++     */
++    public void executeAfterQueuedPackets(Runnable callback) {
++        if (!MinecraftServer.getServer().isMainThread()) {
++            throw new IllegalStateException("Packet barriers must be queued on the server thread");
++        }
++        if (!isConnected()) return;
++        this.i.add(new QueuedPacket(java.util.Objects.requireNonNull(callback, "callback")));
++        this.processQueue();
++    }
++
+     private boolean processQueue() {
+         if (i.isEmpty()) return true;
+         // PandaSpigot start - Make only one flush call per sendPacketQueue() call
+@@ -401,6 +415,19 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+                 return true;
+             }
+ 
++            if (queued.callback != null) {
++                iterator.remove();
++                // writePacket queued preceding writes on this same event loop. Flush
++                // those writes before the callback, even when normal batching is active.
++                this.channel.eventLoop().execute(() -> {
++                    if (isConnected()) {
++                        this.channel.flush();
++                        queued.callback.run();
++                    }
++                });
++                hasWrotePacket = false;
++                continue;
++            }
+             Packet<?> packet = queued.getPacket();
+             if (!packet.isReady()) {
+                 // PandaSpigot start - Make only one flush call per sendPacketQueue() call
+@@ -439,7 +466,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+         EntityPlayer player = getPlayer();
+         i.forEach(queuedPacket -> {
+             Packet<?> packet = queuedPacket.getPacket();
+-            if (packet.hasFinishListener()) {
++            if (packet != null && packet.hasFinishListener()) {
+                 packet.onPacketDispatchFinish(player, null);
+             }
+         });
+@@ -540,10 +567,18 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+ 
+         private final Packet a; private Packet getPacket() { return this.a; } // PandaSpigot - OBFHELPER
+         private final GenericFutureListener<? extends Future<? super Void>>[] b; private GenericFutureListener<? extends Future<? super Void>>[] getGenericFutureListener() { return this.b; } // PandaSpigot - OBFHELPER
++        private final Runnable callback;
+ 
+         public QueuedPacket(Packet packet, GenericFutureListener<? extends Future<? super Void>>... agenericfuturelistener) {
+             this.a = packet;
+             this.b = agenericfuturelistener;
++            this.callback = null;
++        }
++
++        private QueuedPacket(Runnable callback) {
++            this.a = null;
++            this.b = null;
++            this.callback = callback;
+         }
+     }
+ 
+diff --git a/src/test/java/net/minecraft/server/NetworkPacketBarrierTest.java b/src/test/java/net/minecraft/server/NetworkPacketBarrierTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5945671a53aef3ff8b6cf06ebe8b2605cf13f78
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/NetworkPacketBarrierTest.java
+@@ -0,0 +1,102 @@
++package net.minecraft.server;
++
++import io.netty.channel.embedded.EmbeddedChannel;
++import java.lang.reflect.Field;
++import java.util.Queue;
++import java.util.concurrent.atomic.AtomicBoolean;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++public class NetworkPacketBarrierTest extends AbstractTestingBase {
++    private Field serverField;
++    private Object previousServer;
++    private Field configField;
++    private Object previousConfig;
++    private NetworkManager manager;
++    private EmbeddedChannel channel;
++    private Queue<NetworkManager.QueuedPacket> packets;
++
++    @Before
++    @SuppressWarnings("unchecked")
++    public void prepareConnection() throws Exception {
++        serverField = MinecraftServer.class.getDeclaredField("l");
++        serverField.setAccessible(true);
++        previousServer = serverField.get(null);
++        MinecraftServer server = mock(MinecraftServer.class);
++        when(server.isMainThread()).thenReturn(true);
++        serverField.set(null, server);
++        configField = com.hpfxd.pandaspigot.config.PandaSpigotConfig.class.getDeclaredField("config");
++        configField.setAccessible(true);
++        previousConfig = configField.get(null);
++        configField.set(null, new com.hpfxd.pandaspigot.config.PandaSpigotConfig());
++        manager = new NetworkManager(EnumProtocolDirection.SERVERBOUND);
++        channel = new EmbeddedChannel();
++        manager.channel = channel;
++        Field queue = NetworkManager.class.getDeclaredField("i");
++        queue.setAccessible(true);
++        packets = (Queue<NetworkManager.QueuedPacket>) queue.get(manager);
++    }
++
++    @After
++    public void cleanupConnection() throws Exception {
++        if (channel != null) channel.finishAndReleaseAll();
++        serverField.set(null, previousServer);
++        if (configField != null) configField.set(null, previousConfig);
++    }
++
++    @Test
++    public void acknowledgementCannotOvertakeUnreadyBlockUpdate() {
++        DeferredPacket correction = new DeferredPacket();
++        packets.add(new NetworkManager.QueuedPacket(correction));
++        AtomicBoolean acknowledged = new AtomicBoolean();
++        manager.executeAfterQueuedPackets(() -> {
++            assertSame(correction, channel.readOutbound());
++            acknowledged.set(true);
++        });
++        channel.runPendingTasks();
++        assertFalse(acknowledged.get());
++        correction.ready = true;
++        manager.a(); // ordinary network tick releases the queued packet and barrier
++        channel.runPendingTasks();
++        assertTrue(acknowledged.get());
++        assertTrue(packets.isEmpty());
++    }
++
++    @Test
++    public void barrierFlushesEarlierBatchedUpdates() {
++        DeferredPacket correction = new DeferredPacket();
++        correction.ready = true;
++        manager.canFlush = false;
++        packets.add(new NetworkManager.QueuedPacket(correction));
++        AtomicBoolean acknowledged = new AtomicBoolean();
++        manager.executeAfterQueuedPackets(() -> {
++            assertSame(correction, channel.readOutbound());
++            acknowledged.set(true);
++        });
++        channel.runPendingTasks();
++        assertTrue(acknowledged.get());
++    }
++
++    @Test
++    public void closingConnectionDiscardsPendingAcknowledgement() {
++        packets.add(new NetworkManager.QueuedPacket(new DeferredPacket()));
++        AtomicBoolean acknowledged = new AtomicBoolean();
++        manager.executeAfterQueuedPackets(() -> acknowledged.set(true));
++        manager.close(new ChatComponentText("test"));
++        channel.runPendingTasks();
++        assertFalse(acknowledged.get());
++        assertTrue(packets.isEmpty());
++    }
++
++    private static class DeferredPacket implements Packet<PacketListenerPlayOut> {
++        boolean ready;
++        public boolean isReady() { return ready; }
++        public void a(PacketDataSerializer serializer) {}
++        public void b(PacketDataSerializer serializer) {}
++        public void a(PacketListenerPlayOut listener) {}
++    }
++}

@@ -1,0 +1,7 @@
+{
+  "name": "pandaspigot-via-ack-integration",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Local protocol regression test for modern block prediction on PandaSpigot",
+  "devDependencies": { "minecraft-protocol": "1.68.0" }
+}

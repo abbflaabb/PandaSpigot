@@ -1,0 +1,7 @@
+name: PandaSpigotViaAck
+version: '${version}'
+main: com.hpfxd.pandaspigot.viaack.PandaSpigotViaAckPlugin
+description: Orders modern-client block acknowledgements after PandaSpigot packet processing.
+depend: [ViaVersion]
+load: POSTWORLD
+authors: [PandaSpigot]

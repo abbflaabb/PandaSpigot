@@ -1,0 +1,95 @@
+From df007e08e53460d38c12dca6d7827d2dc0646243 Mon Sep 17 00:00:00 2001
+From: Manus <dev-agent@manus.ai>
+Date: Fri, 16 Oct 2026 22:07:36 +0300
+Subject: [PATCH] Handle Unix socket addresses in server network paths
+
+Co-authored-by: Manus <dev-agent@manus.ai>
+---
+ .../minecraft/server/LegacyPingHandler.java   |  2 +-
+ .../net/minecraft/server/NetworkManager.java  | 12 ++++---
+ .../server/NetworkManagerAddressTest.java     | 35 +++++++++++++++++++
+ 3 files changed, 44 insertions(+), 5 deletions(-)
+ create mode 100644 src/test/java/net/minecraft/server/NetworkManagerAddressTest.java
+
+diff --git a/src/main/java/net/minecraft/server/LegacyPingHandler.java b/src/main/java/net/minecraft/server/LegacyPingHandler.java
+index b07e5cb71..07f6940bc 100644
+--- a/src/main/java/net/minecraft/server/LegacyPingHandler.java
++++ b/src/main/java/net/minecraft/server/LegacyPingHandler.java
+@@ -27,7 +27,7 @@ public class LegacyPingHandler extends ChannelInboundHandlerAdapter {
+ 
+         try {
+             if (bytebuf.readUnsignedByte() == 254) {
+-                InetSocketAddress inetsocketaddress = (InetSocketAddress) channelhandlercontext.channel().remoteAddress();
++                InetSocketAddress inetsocketaddress = NetworkManager.normalizeRawAddress(channelhandlercontext.channel().remoteAddress()); // PandaSpigot - Unix domain sockets have no remote IP
+                 MinecraftServer minecraftserver = this.b.d();
+                 int i = bytebuf.readableBytes();
+                 com.destroystokyo.paper.event.server.PaperServerListPingEvent event; // PandaSpigot - Backport PaperServerListPingEvent
+diff --git a/src/main/java/net/minecraft/server/NetworkManager.java b/src/main/java/net/minecraft/server/NetworkManager.java
+index 9ff04c501..39aa3cc8a 100644
+--- a/src/main/java/net/minecraft/server/NetworkManager.java
++++ b/src/main/java/net/minecraft/server/NetworkManager.java
+@@ -550,12 +550,16 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+     // Spigot Start
+     public SocketAddress getRawAddress()
+     {
+-        // PandaSpigot start - This can be null in the case of a Unix domain socket, so if it is, fake something
+-        if (this.channel.remoteAddress() == null) {
+-            return new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0);
++        // PandaSpigot start - Unix domain sockets do not expose an InetSocketAddress
++        return normalizeRawAddress(this.channel.remoteAddress());
++    }
++
++    static java.net.InetSocketAddress normalizeRawAddress(SocketAddress rawAddress) {
++        if (rawAddress instanceof java.net.InetSocketAddress) {
++            return (java.net.InetSocketAddress) rawAddress;
+         }
+         // PandaSpigot end
+-        return this.channel.remoteAddress();
++        return new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0);
+     }
+     // Spigot End
+ 
+diff --git a/src/test/java/net/minecraft/server/NetworkManagerAddressTest.java b/src/test/java/net/minecraft/server/NetworkManagerAddressTest.java
+new file mode 100644
+index 000000000..75d2fdd18
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/NetworkManagerAddressTest.java
+@@ -0,0 +1,35 @@
++package net.minecraft.server;
++
++import io.netty.channel.unix.DomainSocketAddress;
++import java.net.InetSocketAddress;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertSame;
++import static org.junit.Assert.assertTrue;
++
++public class NetworkManagerAddressTest {
++
++    @Test
++    public void preservesInternetSocketAddress() {
++        InetSocketAddress address = new InetSocketAddress("127.0.0.1", 25565);
++
++        assertSame(address, NetworkManager.normalizeRawAddress(address));
++    }
++
++    @Test
++    public void mapsDomainSocketAddressToLoopback() {
++        InetSocketAddress address = NetworkManager.normalizeRawAddress(new DomainSocketAddress("panda-test.sock"));
++
++        assertTrue(address.getAddress().isLoopbackAddress());
++        assertEquals(0, address.getPort());
++    }
++
++    @Test
++    public void mapsMissingAddressToLoopback() {
++        InetSocketAddress address = NetworkManager.normalizeRawAddress(null);
++
++        assertTrue(address.getAddress().isLoopbackAddress());
++        assertEquals(0, address.getPort());
++    }
++}
+-- 
+2.45.1.windows.1
+

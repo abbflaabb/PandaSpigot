@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Admin <callmeabbascallmeabbas@gmail.com>
+Date: Mon, 19 Oct 2026 10:11:15 +0300
+Subject: [PATCH] Scope package sealing to Bukkit and verify the packaged
+ server
+
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index c02fafa65763d83a1348adbb56c18485f45a39d5..755e9558423e7bf921b2c29a8a75ac6e3b03aa47 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -137,7 +137,9 @@ tasks {
+                 "Git-Branch" to gitBranch,
+                 "Git-Commit" to gitHash,
+             )
+-            attributes("Name" to "org/bukkit/", "Sealed" to "true")
++            // Package sealing belongs in a named section. A main-section Sealed
++            // attribute seals every shaded dependency and breaks agents such as SWM.
++            attributes(mapOf("Sealed" to "true"), "org/bukkit/")
+         }
+     }
+ 
+@@ -152,7 +154,7 @@ tasks {
+         mainClass.set("org.bukkit.craftbukkit.Main")
+     }
+ 
+-    register<RemapTask>("remap") {
++    val remap = register<RemapTask>("remap") {
+         description = "Remap the output JAR file using the deprecation mappings"
+ 
+         val inTask = shadowJar.get()
+@@ -169,4 +171,28 @@ tasks {
+     assemble {
+         dependsOn(named("remap"))
+     }
++
++    val compilePackageSealingSmokeTest = register<JavaCompile>("compilePackageSealingSmokeTest") {
++        source("src/test/packaging/PackageSealingSmokeTest.java")
++        classpath = files()
++        destinationDirectory.set(layout.buildDirectory.dir("packageSealingSmokeTest/runner"))
++    }
++
++    val packageSealingSmokeTest = register<JavaExec>("packageSealingSmokeTest") {
++        description = "Verifies dependency/Bukkit package sealing on the packaged server jar."
++        dependsOn(remap, compilePackageSealingSmokeTest)
++        classpath = files(compilePackageSealingSmokeTest.flatMap { it.destinationDirectory })
++        mainClass.set("PackageSealingSmokeTest")
++        inputs.file(remap.flatMap { it.outJarFile })
++        doFirst {
++            setArgs(listOf(
++                remap.get().outJarFile.get().asFile.absolutePath,
++                layout.buildDirectory.dir("packageSealingSmokeTest/fixtures").get().asFile.absolutePath
++            ))
++        }
++    }
++
++    check {
++        dependsOn(packageSealingSmokeTest)
++    }
+ }
+diff --git a/src/test/packaging/PackageSealingSmokeTest.java b/src/test/packaging/PackageSealingSmokeTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..399f39507e5cfb13c28d52fc1c0612ba65a480c2
+--- /dev/null
++++ b/src/test/packaging/PackageSealingSmokeTest.java
+@@ -0,0 +1,75 @@
++import java.io.IOException;
++import java.net.URL;
++import java.net.URLClassLoader;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.jar.Attributes;
++import java.util.jar.JarEntry;
++import java.util.jar.JarFile;
++import java.util.jar.JarOutputStream;
++import javax.tools.ToolProvider;
++
++/** Verifies sealing on the final shaded/remapped jar, not the test classpath. */
++public final class PackageSealingSmokeTest {
++    public static void main(String[] args) throws Exception {
++        Path serverJar = Paths.get(args[0]);
++        Path work = Paths.get(args[1]);
++        Files.createDirectories(work);
++        Path classes = work.resolve("classes");
++        Files.createDirectories(classes);
++        String helper = "PandaPackageSealingProbe";
++        Path yaml = writeSource(work, "org.yaml.snakeyaml.util", helper);
++        Path bukkit = writeSource(work, "org.bukkit", helper);
++        int result = ToolProvider.getSystemJavaCompiler().run(null, null, null,
++                "--release", "8", "-d", classes.toString(), yaml.toString(), bukkit.toString());
++        if (result != 0) throw new AssertionError("Cannot compile package-sealing fixtures");
++        Path extension = work.resolve("extension.jar");
++        try (JarOutputStream jar = new JarOutputStream(Files.newOutputStream(extension))) {
++            for (String pkg : Arrays.asList("org/yaml/snakeyaml/util/", "org/bukkit/")) {
++                String name = pkg + helper + ".class";
++                jar.putNextEntry(new JarEntry(name));
++                Files.copy(classes.resolve(name), jar);
++                jar.closeEntry();
++            }
++        }
++
++        // A Java agent can append additional library classes to the server loader.
++        // Loading an existing SnakeYAML class first reproduces SWM's load order.
++        try (URLClassLoader loader = new URLClassLoader(new URL[] {
++                serverJar.toUri().toURL(), extension.toUri().toURL()
++        }, null)) {
++            Class<?> yamlClass = loader.loadClass("org.yaml.snakeyaml.util.UriEncoder");
++            loader.loadClass("org.yaml.snakeyaml.util." + helper);
++            if (yamlClass.getPackage().isSealed()) throw new AssertionError("SnakeYAML must not be sealed");
++
++            Class<?> bukkitClass = loader.loadClass("org.bukkit.WorldType");
++            if (!bukkitClass.getPackage().isSealed()) throw new AssertionError("Bukkit must remain sealed");
++            try {
++                loader.loadClass("org.bukkit." + helper);
++                throw new AssertionError("An external jar was allowed to extend the sealed Bukkit package");
++            } catch (SecurityException expected) {
++                // Only the intended Bukkit package is sealed.
++            }
++        }
++        try (JarFile jar = new JarFile(serverJar.toFile())) {
++            Attributes main = jar.getManifest().getMainAttributes();
++            if ("true".equalsIgnoreCase(main.getValue(Attributes.Name.SEALED)) || main.getValue("Name") != null) {
++                throw new AssertionError("Package attributes leaked into the main manifest section");
++            }
++            if (!"true".equalsIgnoreCase(jar.getManifest().getAttributes("org/bukkit/").getValue(Attributes.Name.SEALED))) {
++                throw new AssertionError("Bukkit sealing section is missing");
++            }
++        }
++        System.out.println("Package sealing passed: SnakeYAML can be extended; Bukkit remains sealed.");
++    }
++
++    private static Path writeSource(Path work, String pkg, String name) throws IOException {
++        Path source = work.resolve("src").resolve(pkg.replace('.', '/')).resolve(name + ".java");
++        Files.createDirectories(source.getParent());
++        Files.write(source, ("package " + pkg + "; public final class " + name + " {}\n").getBytes(StandardCharsets.UTF_8));
++        return source;
++    }
++}

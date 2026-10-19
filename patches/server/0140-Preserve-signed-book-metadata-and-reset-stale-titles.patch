@@ -1,0 +1,39 @@
+From 2bec7dc01b2354f57981baa2f1c0695b5ec240c8 Mon Sep 17 00:00:00 2001
+From: Manus <dev-agent@manus.ai>
+Date: Fri, 16 Oct 2026 22:04:27 +0300
+Subject: [PATCH] Preserve signed book metadata and reset stale titles
+
+Co-authored-by: Manus <dev-agent@manus.ai>
+---
+ src/main/java/net/minecraft/server/PlayerConnection.java | 2 +-
+ src/main/java/net/minecraft/server/PlayerList.java       | 1 +
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index a4c9ee61c..490f8c609 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -2140,7 +2140,7 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+                     if (itemstack.getItem() == Items.WRITTEN_BOOK && itemstack1.getItem() == Items.WRITABLE_BOOK) {
+                         if (!validateBook(itemstack)) return; // PandaSpigot
+                         // CraftBukkit start
+-                        itemstack1 = new ItemStack(Items.WRITTEN_BOOK);
++                        itemstack1 = itemstack1.cloneItemStack(); // PandaSpigot - Preserve server-side book metadata when signing
+                         itemstack1.a("author", (NBTBase) (new NBTTagString(this.player.getName())));
+                         itemstack1.a("title", (NBTBase) (new NBTTagString(itemstack.getTag().getString("title"))));
+                         itemstack1.a("pages", (NBTBase) itemstack.getTag().getList("pages", 8));
+diff --git a/src/main/java/net/minecraft/server/PlayerList.java b/src/main/java/net/minecraft/server/PlayerList.java
+index 412b354d1..7668ba107 100644
+--- a/src/main/java/net/minecraft/server/PlayerList.java
++++ b/src/main/java/net/minecraft/server/PlayerList.java
+@@ -312,6 +312,7 @@ public abstract class PlayerList {
+         WorldServer worldserver = this.server.getWorldServer(entityplayer.dimension);
+ 
+         // CraftBukkit start
++        entityplayer.playerConnection.sendPacket(new PacketPlayOutTitle(PacketPlayOutTitle.EnumTitleAction.RESET, (IChatBaseComponent) null)); // PandaSpigot - Reset stale client title state on join
+         PlayerJoinEvent playerJoinEvent = new PlayerJoinEvent(cserver.getPlayer(entityplayer), joinMessage);
+         cserver.getPluginManager().callEvent(playerJoinEvent);
+ 
+-- 
+2.45.1.windows.1
+
